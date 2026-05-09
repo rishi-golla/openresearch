@@ -810,17 +810,50 @@ Changes from the initial RLM integration:
 - Data model: `context_chunks` and `context_embeddings` restored alongside `repl_variables` and `rlm_query_log`.
 - Exploration Audit Trail logs both RLM and semantic queries.
 
+## 12. Inter-Agent Communication, Graphify, and Blackboard Architecture
+
+### User
+
+The user asked what else to consider: how agents talk to each other, how subagents talk to parent/each other, how RLM betters context management in multi-agent settings, and whether to consider a graph-based context solution like Graphify (https://github.com/safishamsi/graphify).
+
+### Assistant
+
+The assistant researched four topics via web search:
+
+1. **Inter-Agent Communication (gap in PRD)**: The PRD defined shared state and ownership but never specified the actual communication mechanism. In Claude Agent SDK, subagents cannot talk to each other — only the orchestrator sees their final messages. The assistant proposed an Inter-Agent Communication Protocol section with orchestrator-mediated message passing, a sequential agent pipeline diagram, parallel agent coordination rules, and a structured message format.
+
+2. **Progressive Context Enrichment**: Key RLM + multi-agent insight — when an agent produces structured output (e.g., Paper Claim Map), it gets added back into the RLM REPL as a new variable for downstream agents. Agents don't just consume context, they build on it. The REPL becomes progressively richer through the pipeline.
+
+3. **Graphify as Layer 3**: Graphify builds a structural knowledge graph from code + docs using Tree-sitter AST (deterministic, no LLM) plus LLM semantic extraction. NetworkX + Leiden community detection for clustering. ~1.7k tokens/query vs ~123k naive (71.5x reduction). The assistant proposed it as a third context layer for structural navigation, scheduled for Phase 2 (demo papers have small repos).
+
+4. **Blackboard Architecture**: bMAS pattern (arXiv:2510.01285) where agents self-select tasks from a shared blackboard instead of being assigned by orchestrator. Good for production-scale improvement phase with dynamic N agents. Scheduled for Phase 3+.
+
+PRD changes made:
+
+- New top-level section: **Inter-Agent Communication Protocol** (between Verification Gates and Context Management) with sequential pipeline, parallel coordination, progressive context enrichment, message format, and blackboard evolution.
+- Context Management intro updated from two-layer to **three-layer strategy** (RLM + Semantic + Knowledge Graph).
+- **Knowledge Graph storage layer** expanded with Graphify details, Tree-sitter/Leiden architecture, agent usage examples, and Phase 2 timeline.
+- **Technology Stack** updated with Graphify as Phase 2 layer.
+- **Chat Requirements Traceability** updated with three new rows.
+- **Production Roadmap Phase 2** updated with Graphify integration.
+- **Production Roadmap Phase 3** updated with blackboard architecture.
+- **Backend Services** updated with `graph_builder` module, orchestrator enrichment role.
+- **Data Model** updated with `knowledge_graph_nodes`, `agent_messages` tables.
+- **Open Questions** updated with questions 21-23 (Graphify timing, blackboard threshold, enrichment strategy).
+
+Also in this conversation: docs moved from project root to `docs/` folder and pushed to GitHub.
+
 ## Current Artifacts
 
 ### Product PRD
 
 ```text
-C:\Users\armaa\OneDrive\Desktop\openresearch\reprolab-agent-prd.md
+C:\Users\armaa\OneDrive\Desktop\openresearch\docs\reprolab-agent-prd.md
 ```
 
 ### Chat History
 
 ```text
-C:\Users\armaa\OneDrive\Desktop\openresearch\chathistory.md
+C:\Users\armaa\OneDrive\Desktop\openresearch\docs\chathistory.md
 ```
 

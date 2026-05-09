@@ -42,6 +42,9 @@ This section verifies that the PRD reflects the key product decisions from the p
 | Discuss human-in-the-loop boundaries for cost, credentials, ambiguous assumptions, and risky actions. | Human-In-The-Loop Policy, Core System Design Decisions. | Captured |
 | Index baseline paper context and field history for agent retrieval. | Research Context Index, Context Management, Implementation Details. | Captured |
 | Use Recursive Language Models (RLM) for context exploration instead of vector-store retrieval. | Context Management, Research Context Index, Technology Stack. | Captured |
+| Define how agents communicate and pass structured outputs to each other. | Inter-Agent Communication Protocol, Context Management. | Captured |
+| Consider graph-based context (Graphify) for structural code/paper analysis. | Knowledge Graph (Storage Layers), Technology Stack, Production Roadmap Phase 2. | Captured |
+| Consider blackboard architecture for production-scale agent coordination. | Production Roadmap Phase 3. | Captured |
 | Add production-grade trust, safety, versioning, cost, and evaluation controls. | Trust, Safety, And Evaluation, Implementation Details, Success Metrics. | Captured |
 
 Unresolved items from the conversation are intentionally preserved as open product questions: the first demo paper, exact runtime budget, dataset-size threshold, GPU cost threshold, verifier voting rules, and the confidence threshold for labeling a result verified.
@@ -128,6 +131,7 @@ These decisions are locked for the hackathon build. They are not open questions.
 | LLM | `claude-sonnet-4-6` for all agents | Best balance of capability and speed for multi-agent workloads |
 | Context exploration (Layer 1) | Recursive Language Models (RLM) | Primary exploration: context stored as REPL variables; agents programmatically explore, partition, and recursively sub-query; ~2-3k tokens per query; based on [arXiv:2512.24601](https://arxiv.org/abs/2512.24601) |
 | Context discovery (Layer 2) | Chroma | Fallback and fuzzy discovery: semantic search for conceptual similarity, cross-document connections, and content the agent didn't know to look for |
+| Knowledge graph (Layer 3, Phase 2) | [Graphify](https://github.com/safishamsi/graphify) | Structural knowledge graph from code + docs + papers via Tree-sitter AST + LLM semantic extraction; NetworkX + Leiden community detection; ~1.7k tokens/query vs ~123k naive (71.5x reduction) |
 | RLM implementation | [alexzhang13/rlm](https://github.com/alexzhang13/rlm) or [ysz/recursive-llm](https://github.com/ysz/recursive-llm) | Official and community implementations; LiteLLM-based, works with Claude via API |
 | Metadata store | SQLite | Zero-config, file-based, sufficient for single-machine MVP |
 | Container runtime | Docker (local) | Sandbox isolation; cloud GPU deferred to Phase 3 |
@@ -821,17 +825,161 @@ An improvement is accepted only if:
 - It does not exploit leakage.
 - It does not secretly change the task.
 
+## Inter-Agent Communication Protocol
+
+ReproLab agents coordinate through the **orchestrator-mediated message passing** pattern, consistent with the Claude Agent SDK's subagent model. Agents do not talk to each other directly — the orchestrator is the message bus.
+
+### Communication Model
+
+In the Claude Agent SDK, each subagent:
+
+- Runs in its own context window with its own tools.
+- Receives a task description and input context from the orchestrator.
+- Returns only its **final message** to the orchestrator — all intermediate tool calls stay inside the subagent.
+- Cannot communicate directly with sibling agents.
+
+The orchestrator mediates all coordination: it reads each agent's structured output, decides the next step, and passes relevant context to the next agent.
+
+### Sequential Agent Pipeline
+
+Builder agents execute in sequence. Each agent's structured output becomes input for the next.
+
+```text
+Orchestrator
+  ├─→ Paper Understanding Agent
+  │     writes: paper_claim_map, ambiguity_index
+  │     returns: summary to Orchestrator
+  │
+  ├─→ Artifact Discovery Agent
+  │     reads: paper_claim_map
+  │     writes: artifact_index, repo_files, github_issues
+  │     returns: summary to Orchestrator
+  │
+  ├─→ Environment Detective Agent
+  │     reads: artifact_index, repo_files, github_issues
+  │     writes: environment_spec, assumption_ledger entries
+  │     returns: summary to Orchestrator
+  │
+  ├─→ Reproduction Planner
+  │     reads: paper_claim_map, environment_spec, assumption_ledger
+  │     writes: reproduction_contract
+  │     returns: plan to Orchestrator → Gate 1 Verification
+  │
+  ├─→ Baseline Implementation Agent
+  │     reads: reproduction_contract, repo_files, configs
+  │     writes: baseline code, Dockerfile, commands
+  │     returns: summary to Orchestrator
+  │
+  ├─→ Experiment Runner
+  │     reads: baseline code, Dockerfile
+  │     writes: runs/baseline/ artifacts (logs, metrics, plots)
+  │     returns: results to Orchestrator → Gate 2 Verification
+  │
+  ├─→ Improvement Orchestrator
+  │     reads: verified baseline, assumption_ledger, field_history
+  │     writes: improvement hypotheses
+  │     returns: N hypothesis briefs to Orchestrator
+  │
+  └─→ Improvement Path Agents (parallel)
+        each reads: hypothesis brief, verified baseline commit
+        each writes: runs/improvements/path_{id}/
+        each returns: results to Orchestrator → Gate 3 Verification
+```
+
+### Parallel Agent Coordination
+
+During the improvement phase, path agents run concurrently:
+
+- Each path agent writes only to its own artifact directory (`runs/improvements/path_{id}/`).
+- No path agent reads another path agent's directory during execution.
+- All updates to shared ledgers (assumptions, experiments, decisions) go through the orchestrator's append API.
+- The orchestrator collects all path agent results before triggering Gate 3 verification.
+
+### Progressive Context Enrichment
+
+As agents complete, their structured outputs are added back into the RLM Context REPL as new variables. This means downstream agents have access to the full enriched context built by upstream agents.
+
+```python
+# Initial REPL state (project start)
+repl = {
+    'paper_text': "...",
+    'repo_files': {...},
+    'configs': {...},
+    # ... raw artifacts only
+}
+
+# After Paper Understanding Agent
+repl['paper_claim_map'] = paper_understanding_output['claim_map']
+repl['ambiguity_index'] = paper_understanding_output['ambiguities']
+
+# After Artifact Discovery Agent
+repl['artifact_index'] = artifact_discovery_output['artifacts']
+repl['github_issues'] = artifact_discovery_output['issues']
+
+# After Environment Detective Agent
+repl['environment_spec'] = env_detective_output['spec']
+
+# After Gate 2 verification
+repl['baseline_metrics'] = verified_baseline['metrics']
+repl['baseline_verification'] = verified_baseline['verification']
+
+# By the time Improvement Agents run, the REPL contains everything:
+# raw artifacts + claim map + environment spec + verified baseline + ...
+```
+
+This progressive enrichment means agents don't just consume context — they **build on it**. Each agent's output becomes a queryable REPL variable for every downstream agent.
+
+### Message Format
+
+Each agent returns a structured message to the orchestrator:
+
+```json
+{
+  "agent_id": "environment_detective",
+  "status": "completed",
+  "structured_outputs": {
+    "environment_spec": { "...": "..." },
+    "assumptions_created": ["A001", "A002"],
+    "decisions_made": ["D001"]
+  },
+  "summary": "Recovered Python 3.8, PyTorch 1.12, CUDA 11.3. Two assumptions created for unspecified cuDNN version and batch size.",
+  "exploration_log": {
+    "repl_queries": 12,
+    "rlm_sub_queries": 4,
+    "semantic_searches": 1,
+    "tokens_used": 8400
+  }
+}
+```
+
+The orchestrator uses `structured_outputs` to update shared state and the REPL. The `summary` is what the orchestrator sees in its own context window. The `exploration_log` feeds the audit trail.
+
+### Production Evolution: Blackboard Pattern
+
+For the hackathon MVP, the orchestrator-mediated pattern is sufficient — the pipeline is well-defined and the number of agents is small.
+
+In production (Phase 3+), the improvement phase could evolve to a **blackboard architecture** inspired by [bMAS](https://arxiv.org/abs/2510.01285):
+
+- A shared blackboard replaces orchestrator-assigned tasks.
+- Improvement agents monitor the blackboard and **self-select** tasks based on their capabilities.
+- The orchestrator becomes a lightweight coordinator rather than a rigid controller.
+- This scales better when N improvement agents is dynamic and large.
+
+The blackboard pattern eliminates the bottleneck of a single orchestrator needing to understand every agent's capabilities and assign work accordingly. Agents volunteer based on what they can contribute.
+
 ## Context Management
 
 The system should not dump the full paper, repo, and logs into every agent. That will be expensive, noisy, and unreliable.
 
-Instead, the system uses a **two-layer context exploration strategy**: Recursive Language Models (RLM) as the primary exploration mechanism, backed by a Semantic Index for fuzzy discovery and fallback.
+Instead, the system uses a **three-layer context exploration strategy**, with each layer handling a different type of query:
 
-**Layer 1 — RLM (primary).** Based on [arXiv:2512.24601](https://arxiv.org/abs/2512.24601) (Zhang, Kraska & Khattab, MIT CSAIL), the RLM paradigm treats long context as an external environment: context is stored as Python variables in a REPL, and agents programmatically examine, decompose, and recursively sub-query themselves over snippets of the context. This uses ~2-3k tokens per query instead of stuffing 95k+ tokens into prompts. RLM is best when the agent knows roughly where to look — parsing configs, grepping for version numbers, drilling into a specific paper section.
+**Layer 1 — RLM Context REPL (primary).** Based on [arXiv:2512.24601](https://arxiv.org/abs/2512.24601) (Zhang, Kraska & Khattab, MIT CSAIL), the RLM paradigm treats long context as an external environment: context is stored as Python variables in a REPL, and agents programmatically examine, decompose, and recursively sub-query themselves over snippets of the context. This uses ~2-3k tokens per query instead of stuffing 95k+ tokens into prompts. RLM is best when the agent knows roughly where to look — parsing configs, grepping for version numbers, drilling into a specific paper section.
 
 **Layer 2 — Semantic Index (fallback and discovery).** A lightweight vector store (Chroma) indexes the same artifacts as chunked embeddings. This layer handles what RLM cannot: fuzzy conceptual similarity ("what other approaches solve this problem similarly?"), surfacing relevant content the agent didn't know to look for, and cross-document discovery where keyword search would miss semantic connections. Agents fall back to semantic search when RLM exploration doesn't yield enough evidence.
 
-**Layered workflow:** Agents use RLM first. If programmatic exploration is insufficient, they query the Semantic Index for candidates, then use RLM to recursively drill into those candidates. This gives both perfect recall (RLM) and fuzzy discovery (embeddings).
+**Layer 3 — Knowledge Graph (structural navigation, Phase 2).** [Graphify](https://github.com/safishamsi/graphify) builds a structural knowledge graph from code and documents using Tree-sitter AST extraction and LLM-driven semantic extraction. This layer handles structural queries that neither RLM nor embeddings are well-suited for: "What functions call the training loop?", "What modules import this class?", "What paper concepts cluster together?" MVP uses relational tables; Phase 2 introduces Graphify for automated graph construction.
+
+**Layered workflow:** Agents use RLM first for precise programmatic exploration. If insufficient, they query the Semantic Index for fuzzy discovery. They use the Knowledge Graph for structural navigation of code and concept relationships. Results from any layer can feed into RLM for recursive drill-down.
 
 ### Recursive Context Exploration (RLM)
 
@@ -1123,9 +1271,9 @@ Example source record:
 }
 ```
 
-#### Knowledge Graph
+#### Knowledge Graph (Layer 3 — structural relationships)
 
-Stores structured relationships between entities.
+Stores structured relationships between entities. This layer answers questions like "What functions call the training loop?", "What config files set hyperparameters?", and "What concepts does this paper share with prior work?"
 
 Example relationships:
 
@@ -1140,9 +1288,41 @@ config_file -> sets -> hyperparameter
 issue -> reports_failure -> environment_setup
 run -> produced_metric -> metric_value
 assumption -> supported_by -> source
+function -> calls -> function
+class -> inherits -> class
+module -> imports -> module
+paper_concept -> semantically_similar_to -> paper_concept
 ```
 
-MVP can implement this with relational tables. Production can move high-volume relationship queries to a graph database if needed.
+**MVP:** Use relational tables in SQLite for graph-like relationships. Sufficient for the two demo papers with small repos.
+
+**Phase 2: Graphify integration.** Use [Graphify](https://github.com/safishamsi/graphify) to automate knowledge graph construction from code and documents:
+
+- **Pass 1 (deterministic):** Tree-sitter AST extraction of code structure — classes, functions, imports, call graphs, docstrings. No LLM needed.
+- **Pass 2 (transcription):** Audio/video files transcribed with faster-whisper (if applicable).
+- **Pass 3 (semantic):** Claude subagents extract concepts, relationships, and design rationale from docs, papers, and images.
+- **Merge:** Results merged into a NetworkX graph, clustered with Leiden community detection, exported as interactive HTML + queryable JSON + audit report.
+
+Graphify provides ~1.7k tokens per query vs ~123k naive (71.5x reduction). It supports 25 languages via Tree-sitter and handles multi-modal inputs (code, docs, papers, images, videos).
+
+**How agents use the Knowledge Graph:**
+
+Agents query the graph for structural navigation, then use RLM to drill into the content:
+
+```python
+# Agent queries the knowledge graph
+training_functions = graph_query("function", calls="train")
+config_hyperparams = graph_query("config_file", sets="hyperparameter")
+
+# Then uses RLM to explore the actual content of those files
+for func in training_functions:
+    detail = rlm_query(
+        "What optimizer, learning rate, and batch size does this function use?",
+        repo_files[func['file_path']]
+    )
+```
+
+**Production:** Move high-volume relationship queries to a dedicated graph database (Neo4j, etc.) if needed.
 
 #### Semantic Index (Layer 2 — fallback and discovery)
 
@@ -1999,6 +2179,7 @@ Add:
 - Re-run button.
 - Human approval checkpoints.
 - Reproducibility scoring.
+- **Graphify knowledge graph integration** — automated structural graph construction from code + docs via Tree-sitter AST and LLM semantic extraction; queryable graph for navigating code architecture and paper concept relationships.
 
 ### Phase 3: Cloud Execution
 
@@ -2014,6 +2195,7 @@ Add:
 - Resume failed runs.
 - Environment cache.
 - Secrets management.
+- **Blackboard architecture for improvement phase** — replace orchestrator-assigned improvement tasks with a shared blackboard where agents self-select based on capabilities; inspired by [bMAS](https://arxiv.org/abs/2510.01285); scales better for dynamic N improvement agents.
 
 ### Phase 4: Production Platform
 
@@ -2046,7 +2228,8 @@ Recommended backend modules:
 - `artifact_discovery`: searches and indexes external artifacts.
 - `environment_builder`: creates Dockerfiles and lockfiles.
 - `sandbox_manager`: creates isolated local workspaces.
-- `agent_orchestrator`: schedules builder, runner, verifier, and supervisor agents.
+- `agent_orchestrator`: schedules builder, runner, verifier, and supervisor agents. Mediates inter-agent communication and manages progressive context enrichment (adding agent outputs back to REPL).
+- `graph_builder`: (Phase 2) runs Graphify over repo + docs to construct the knowledge graph. Exposes `graph_query()` to agents.
 - `experiment_runner`: executes commands and captures outputs.
 - `verification`: runs verifier agents and stores decisions.
 - `artifact_store`: stores logs, plots, metrics, diffs, and reports.
@@ -2078,8 +2261,10 @@ Core tables or collections:
 - `context_embeddings` (vector embeddings in Chroma, referenced by chunk ID)
 - `repl_variables` (tracks which variables are loaded per project and their source mappings)
 - `rlm_query_log` (logs every `rlm_query()` sub-call: agent, question, context segment, answer, tokens used)
-- `knowledge_graph_edges`
-- `exploration_events` (logs both REPL code executions and `semantic_search()` fallback queries)
+- `knowledge_graph_edges` (relational tables for MVP; Graphify NetworkX export for Phase 2)
+- `knowledge_graph_nodes` (entities: functions, classes, paper concepts, configs — populated by Graphify in Phase 2)
+- `agent_messages` (structured messages between agents and orchestrator; tracks progressive context enrichment)
+- `exploration_events` (logs REPL code executions, `semantic_search()` fallback queries, and `graph_query()` structural lookups)
 - `field_context_summaries`
 - `contradictions`
 - `provenance_manifests`
@@ -2261,6 +2446,9 @@ Resolved questions are marked with their decision.
 18. What minimum seed count is required before calling an improvement verified in production? (Suggested: 3 seeds for production; 1 seed clearly labeled for hackathon.)
 19. What license states should block work versus require user approval?
 20. What resource limits should local Docker sandboxes enforce by default? (Suggested: 4 CPU, 8 GB RAM, 20 GB disk, 30-minute wall-clock timeout.)
+21. Should the Knowledge Graph (Graphify) be MVP or Phase 2? (Decision: Phase 2 — demo papers have small repos; Graphify pays off with larger codebases.)
+22. At what scale of improvement agents should the system switch from orchestrator-mediated to blackboard-based coordination? (Suggested: blackboard for N > 5 concurrent improvement agents.)
+23. Should progressive context enrichment be eager (add all agent outputs to REPL immediately) or lazy (add only when a downstream agent requests it)?
 
 ## Recommended MVP Positioning
 
