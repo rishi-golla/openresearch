@@ -1,22 +1,18 @@
 # ReproLab Agent PRD
 
-## Product Summary
+## Overview
 
 **Working name:** ReproLab Agent
 
 **One-line summary:** ReproLab is an autonomous research agent system that takes an ML or software-only robotics paper, reconstructs its implementation environment, reproduces the paper's core algorithm on the same dataset and specifications, then launches multiple improvement agents whose results are independently verified by a supervisor-led verification team.
 
-## Track Fit
+**Track Fit:** ReproLab fits the Agents Track — it accepts a high-level research goal, breaks reproduction into concrete steps, reads papers/repos/configs/datasets, uses external tools (Docker, Git, package managers), makes decisions under ambiguity, recovers from failures, and produces runnable environments, code, logs, metrics, plots, diffs, and verified reports.
 
-ReproLab fits the Agents Track because it is not a chatbot or simple LLM wrapper. It is a multi-agent system that:
+**Target users:** ML researchers, robotics researchers (simulation/offline), research engineers, AI labs, graduate students, R&D teams evaluating whether a paper is worth building on.
 
-- Accepts a high-level research goal.
-- Breaks reproduction into concrete steps.
-- Reads papers, repositories, configs, datasets, logs, and experiment artifacts.
-- Uses external tools such as Docker, Git, package managers, remote compute, and experiment runners.
-- Makes decisions under ambiguity.
-- Recovers from failed builds, missing dependencies, and incomplete paper details.
-- Produces concrete outputs: runnable environments, code, logs, metrics, plots, diffs, and verified reports.
+**Problem:** Papers omit implementation details, depend on brittle environments, use underspecified data pipelines, and leave reproduction to humans. Repositories may be broken, incomplete, outdated, or misaligned with the paper.
+
+**Goal:** Turn a paper into a reproducible, auditable, extensible experiment workspace. Outputs: Docker image, reproduction codebase, dataset scripts, logs, metrics, plots, commit diff, command history, assumption ledger, reproducibility score, verified baseline report, N improvement branches with verified outcomes, and a research map of promising paths, dead ends, and next experiments.
 
 ## Chat Requirements Traceability
 
@@ -55,52 +51,7 @@ Unresolved items from the conversation are intentionally preserved as open produ
 
 Post-validation additions not in the original conversation: two-mode Baseline Implementation Agent (adapt vs. implement from paper), shared state write protocol, explicit Research Map ownership assigned to the Supervisor Verification Agent, simulator version support in the Environment Detective Agent, `provenance.json` in the artifact schema, and clarification of open question 17.
 
-Pre-build decisions locked after validation: demo papers are PPO (CartPole-v1) and MixMatch (CIFAR-10); agent orchestration framework is Claude Agent SDK; context exploration uses a two-layer strategy — RLM Context REPL as primary (programmatic exploration) and Chroma as fallback (fuzzy semantic discovery); metadata store is SQLite; SSH/cloud GPU support is deferred to Phase 3 and out of scope for the hackathon build.
-
-## Target Users
-
-Primary users:
-
-- ML researchers.
-- Robotics researchers working in simulation or offline datasets.
-- Research engineers.
-- AI labs.
-- Graduate students.
-- R&D teams evaluating whether a paper is worth building on.
-
-## Problem
-
-Research papers often omit implementation details, depend on brittle environments, use underspecified data pipelines, and leave reproduction work to humans. Even when code exists, the repository may be broken, incomplete, outdated, or not aligned with the paper.
-
-Researchers need a system that can:
-
-- Reconstruct the paper's actual contribution.
-- Build a runnable environment.
-- Execute the baseline.
-- Record every assumption.
-- Explore improvements.
-- Distinguish real progress from fake or non-comparable results.
-- Preserve successful and failed research directions.
-
-## Product Goal
-
-Turn a paper into a reproducible, auditable, extensible experiment workspace.
-
-The product should produce:
-
-- Runnable Docker image or Dockerfile.
-- Reproduction codebase.
-- Dataset setup scripts.
-- Logs.
-- Metrics file.
-- Plots.
-- Commit diff.
-- Exact command history.
-- Assumption ledger.
-- Reproducibility score.
-- Verified baseline report.
-- N improvement branches with verified outcomes.
-- Research map showing promising paths, dead ends, inconclusive results, and next experiments.
+Pre-build decisions locked after validation: demo papers are PPO (CartPole-v1) and MixMatch (CIFAR-10); agent orchestration framework is Claude Agent SDK; context exploration uses a unified REPL workspace with raw variables + `rlm_query()` + `semantic_search()` + `graph_query()` + `web_search()` + `notebook_query()`; metadata store is SQLite; SSH/cloud GPU support is deferred to Phase 3 and out of scope for the hackathon build.
 
 ## Scope Decision
 
@@ -138,6 +89,7 @@ These decisions are locked for the hackathon build. They are not open questions.
 | Knowledge graph (Layer 3, Phase 2) | [Graphify](https://github.com/safishamsi/graphify) | Structural knowledge graph from code + docs + papers via Tree-sitter AST + LLM semantic extraction; NetworkX + Leiden community detection; ~1.7k tokens/query vs ~123k naive (71.5x reduction) |
 | RLM implementation | [alexzhang13/rlm](https://github.com/alexzhang13/rlm) or [ysz/recursive-llm](https://github.com/ysz/recursive-llm) | Official and community implementations; LiteLLM-based, works with Claude via API |
 | Code generation (no-repo path) | [PaperCoder / Paper2Code](https://github.com/going-doer/Paper2Code) | Multi-agent paper→code framework; used in Baseline Implementation Agent Mode 2 when no reference repo exists; [arXiv:2504.17192](https://arxiv.org/abs/2504.17192) |
+| External search | Web search + Google NotebookLM | Agents use `web_search()` for field conventions, benchmark standards, and ambiguity resolution; `notebook_query()` for cross-referencing across project sources loaded into NotebookLM |
 | Metadata store | SQLite | Zero-config, file-based, sufficient for single-machine MVP |
 | Frontend | Next.js (React) | Real-time agent lab dashboard showing agent topology, reasoning, messages, and citations |
 | Real-time events | WebSocket or SSE from Python backend to Next.js frontend | Stream agent activity, reasoning steps, and inter-agent messages as they happen |
@@ -999,8 +951,10 @@ The REPL is the single workspace. Inside it, agents have:
 - **`semantic_search()`** — a function available in the REPL that queries the Chroma vector store for fuzzy conceptual similarity and cross-document discovery. Handles what programmatic search cannot: "what other approaches solve this problem similarly?"
 - **`graph_query()`** — a function available in the REPL that queries the knowledge graph for structural relationships. Handles code architecture navigation: "what functions call `train()`?", "what configs set hyperparameters?" MVP uses relational tables; Phase 2 uses [Graphify](https://github.com/safishamsi/graphify) for automated graph construction.
 - **`rlm_query()`** — a function that launches a recursive LLM sub-call over a specific context segment. Used to drill into results from any of the above.
+- **`web_search()`** — a function that searches the web for external evidence. Used for resolving ambiguities, finding field conventions, checking benchmark standards, and discovering information not present in local artifacts.
+- **`notebook_query()`** — a function that queries Google NotebookLM with project sources loaded. Each agent has access to a NotebookLM notebook pre-loaded with the paper, repo docs, and field history. Used for cross-referencing, summarization, and discovering connections across sources that the agent might miss with programmatic search alone.
 
-**There is no fallback sequence.** Agents combine all four tools in whatever order the question demands:
+**There is no fallback sequence.** Agents combine all six tools in whatever order the question demands:
 
 ```python
 # One agent, one REPL session — all tools used together
@@ -1128,10 +1082,12 @@ for filepath, content in relevant_files.items():
 | --- | --- | --- |
 | Raw variables (`paper_text`, `repo_files`, etc.) | Direct Python access to all project artifacts | Precise structured queries — grep, filter, parse, slice |
 | `rlm_query(question, context)` | Recursive LLM sub-call over a specific context segment | Drilling into large text segments without exceeding token limits |
-| `semantic_search(query, sources, top_k)` | Fuzzy embedding-based retrieval from Chroma | Conceptual similarity, cross-document discovery, finding what the agent didn't know to look for |
-| `graph_query(entity_type, **relationships)` | Structural query against the knowledge graph | Code architecture navigation, entity relationships, concept clustering |
+| `semantic_search(query, sources, top_k)` | Fuzzy embedding-based retrieval from Chroma | Conceptual similarity, cross-document discovery |
+| `graph_query(entity_type, **relationships)` | Structural query against the knowledge graph | Code architecture navigation, entity relationships |
+| `web_search(query)` | Search the web for external evidence | Field conventions, benchmark standards, ambiguity resolution, info not in local artifacts |
+| `notebook_query(question)` | Query Google NotebookLM loaded with project sources | Cross-referencing across paper + repo + field history, summarization, connection discovery |
 
-All four tools are available simultaneously in every REPL session. Agents combine them freely:
+All six tools are available simultaneously in every REPL session. Agents combine them freely:
 
 ```python
 # Example: Environment Detective finding PyTorch version
@@ -1228,13 +1184,11 @@ Multiple agents run concurrently during the improvement phase. To prevent confli
 - The canonical baseline directory `runs/baseline/` becomes read-only after Gate 2 verification passes.
 - The orchestrator serializes ledger writes even when path agents run in parallel.
 
-## Research Context Index
+### Research Context Index
 
-ReproLab needs a dedicated context indexing system so agents can reason from the baseline paper, its implementation artifacts, and the field's surrounding research history without stuffing every source into every prompt.
+The context system acts as an auditable research memory layer. Agents ask targeted questions, receive source-backed evidence, and record which retrieved evidence influenced each decision.
 
-The context system should act like an auditable research memory layer. Agents ask targeted questions, receive source-backed context packets, and record which retrieved evidence influenced each decision.
-
-### Context Index Goals
+#### Context Index Goals
 
 The index should help agents answer questions such as:
 
@@ -1247,7 +1201,7 @@ The index should help agents answer questions such as:
 - What known implementation traps exist in this field?
 - What wrong directions have already been explored?
 
-### Two-Index Design
+#### Two-Index Design
 
 Use two coordinated indexes instead of one generic vector store.
 
@@ -1302,9 +1256,7 @@ Structured outputs:
 - Benchmark history: standard datasets, metrics, leaderboard movement, and common evaluation traps.
 - Failure history: known replication failures, dependency failures, data leakage risks, and missing-detail reports.
 
-### Storage Layers
-
-The Research Context Index uses three storage layers.
+#### Storage Layers
 
 #### Artifact Index
 
@@ -1399,7 +1351,7 @@ All raw text from the Artifact Index is loaded into REPL variables. The Semantic
 5. Knowledge graph is built from code (Tree-sitter AST) and docs (LLM extraction).
 6. Agents receive the unified REPL with variables + `rlm_query()` + `semantic_search()` + `graph_query()` and a scoped system prompt.
 
-### Per-Agent REPL Scopes
+#### Per-Agent REPL Scopes
 
 Each agent shares the same Context REPL (all variables + all tools: `rlm_query()`, `semantic_search()`, `graph_query()`) but receives a scoped system prompt directing it to the variables and tools most relevant to its task. Agents combine tools freely.
 
@@ -1457,7 +1409,7 @@ Primary variables: all variables (full REPL access), plus `experiment_ledger`, `
 
 Purpose: Decide verified, caveated, partial, failed, blocked, or invalid by cross-referencing all evidence.
 
-### Field History Collection Workflow
+#### Field History Collection Workflow
 
 For each baseline paper, ReproLab should build a field context pack.
 
@@ -1481,7 +1433,7 @@ Production workflow:
 - Maintain cross-project memory of previous reproductions.
 - Reuse verified baselines and environment recipes across related papers.
 
-### Source Trust And Confidence
+#### Source Trust And Confidence
 
 Every retrieved source should carry a trust level.
 
@@ -1506,7 +1458,7 @@ Confidence: medium
 Assumption risk: medium
 ```
 
-### Mandatory Citation Policy
+#### Mandatory Citation Policy
 
 **Every agent decision must include citations.** This is not optional and not limited to high-impact decisions. Citations are a core product feature — they make ReproLab's work trustworthy and auditable.
 
@@ -1547,7 +1499,7 @@ Citation format:
 }
 ```
 
-### Exploration Audit Trail
+#### Exploration Audit Trail
 
 **Every** agent decision must log:
 
@@ -1565,7 +1517,7 @@ Citation format:
 
 This prevents "exploration for vibes" and makes context usage auditable. The RLM layer produces naturally transparent audit trails (explicit code), while semantic search queries are logged with the reason the agent fell back to fuzzy retrieval. Every decision in the audit trail links back to specific sources visible in the dashboard's Citation Explorer.
 
-### MVP Implementation Recommendation
+#### MVP Implementation Recommendation
 
 For the hackathon MVP:
 
@@ -1658,15 +1610,18 @@ Common contradictions:
 - Main branch changed after publication.
 - arXiv v1 and arXiv v3 differ.
 
-Default source-of-truth priority:
+Default source-of-truth priority (10 levels):
 
 1. Paper and appendix.
 2. Official release tag, commit, or archive matching the paper date.
 3. Official repository main branch.
 4. Author comments, issues, or documentation.
-5. Maintained reproduction repositories.
-6. Community implementations.
-7. Agent inference.
+5. Papers directly cited as methodological basis (e.g., "we follow the training procedure of Smith et al." — Smith et al. specifies the details this paper omitted).
+6. Maintained reproduction repositories.
+7. Later papers that reproduce or cite this paper (reproduction reports that document what actually worked).
+8. Community implementations (blog posts, forums, unofficial forks).
+9. Field conventions and benchmark standards (common practices in the subfield that nobody cites explicitly).
+10. Agent inference (agent's best guess with no supporting evidence).
 
 The system should not silently resolve contradictions. It should create a contradiction record, select a provisional resolution, assign risk, and send high-impact contradictions to verification or human approval.
 
@@ -1965,67 +1920,19 @@ User approval is required for:
 - "Official repo unavailable. Use community implementation?"
 - "Paper omits preprocessing details. Accept inferred preprocessing from official repository?"
 
-## Compute Strategy
+## Infrastructure
 
-### MVP Compute
+### Compute
 
-The MVP uses:
+**MVP:** Local Docker, CPU-first, small ML papers, reduced training runs (clearly labeled). The two demo papers (PPO on CartPole-v1, MixMatch on CIFAR-10 with reduced epochs) run on CPU. SSH/cloud GPU deferred to Phase 3.
 
-- Local Docker.
-- CPU-first experiments.
-- Small ML papers.
-- Reduced training runs where necessary.
-- Optional user-provided datasets.
-- Optional user-provided GitHub repositories.
+**Production:** Managed remote runners, GPU queue, budget controls, resource estimates, reusable environment cache, artifact storage, job cancellation/resumption, secrets management.
 
-Reduced runs must be clearly labeled as reduced, not full reproduction.
+### Git And Sandbox Strategy
 
-### Near-Term Compute
+**Baseline:** Create baseline branch → build Docker environment → run experiments → freeze verified baseline after Gate 2.
 
-SSH/cloud GPU support is deferred to Phase 3. All hackathon work uses local Docker only.
-
-The two demo papers (PPO on CartPole-v1 and MixMatch on CIFAR-10 with reduced epochs) run on CPU within acceptable wall-clock times for a hackathon demo.
-
-### Production Compute
-
-Production should support:
-
-- Managed remote runners.
-- GPU queue.
-- Budget controls.
-- Resource estimates.
-- Reusable environment cache.
-- Artifact storage.
-- Job cancellation.
-- Job resumption.
-- Secrets management.
-
-## Git And Sandbox Strategy
-
-### Baseline
-
-- Create a baseline branch.
-- Build Docker environment.
-- Run baseline experiments.
-- Freeze verified baseline after approval.
-
-### Improvement Paths
-
-Each improvement path gets:
-
-- Branch: `improvement/path-{id}-{slug}`.
-- Sandbox: `sandboxes/path-{id}`.
-- Artifacts: `runs/improvements/path_{id}`.
-- Metrics file.
-- Logs.
-- Command history.
-- Diff patch.
-
-Rules:
-
-- No path agent can edit the canonical baseline.
-- No path agent can overwrite another path's artifacts.
-- All comparisons must point to the verified baseline commit.
+**Improvement paths:** Each path gets its own branch (`improvement/path-{id}-{slug}`), sandbox (`sandboxes/path-{id}`), and artifact directory (`runs/improvements/path_{id}/`). No path agent can edit the canonical baseline or another path's artifacts. All comparisons must reference the verified baseline commit.
 
 ## Artifact Schema
 
@@ -2157,72 +2064,15 @@ Each verifier agent assesses the **complexity, risk, and evidence quality** of w
 }
 ```
 
-### Factors That Raise The Threshold
+Threshold is raised by: novel/complex algorithms, ambiguous descriptions, no reference implementation, weak/contradictory evidence, high assumption count, high result sensitivity. Threshold is lowered by: exact code match, multiple primary sources agree, standard technique, config file explicitly states value. The Supervisor can override any threshold with recorded reasoning.
 
-- Novel or complex algorithms.
-- Ambiguous paper descriptions.
-- No reference implementation available.
-- Weak or contradictory evidence.
-- High assumption count in this area.
-- Result sensitivity to this component (e.g., wrong learning rate schedule ruins everything).
+### Reproducibility Score
 
-### Factors That Lower The Threshold
+Final score: environment recovered (0-100), method fidelity (0-100), data pipeline confidence (0-100), metric validity (0-100), artifact completeness (0-100), assumption risk (low/medium/high), dynamic confidence thresholds used per item, overall status (verified/partial/failed/blocked/invalid).
 
-- Exact match with reference code.
-- Multiple primary sources agree.
-- Standard well-known technique.
-- Low sensitivity (e.g., logging frequency).
-- Config file explicitly states the value.
+### Research Map
 
-### Supervisor Override
-
-The Supervisor Verification Agent reviews each verifier's dynamic threshold and can override it (raise or lower) with recorded reasoning. The final threshold and its justification are included in the verification report and visible in the dashboard.
-
-## Reproducibility Score
-
-Final score should include:
-
-- Environment recovered: 0-100.
-- Method fidelity: 0-100.
-- Data pipeline confidence: 0-100.
-- Metric validity: 0-100.
-- Artifact completeness: 0-100.
-- Assumption risk: low, medium, or high.
-- Dynamic confidence thresholds used (per verification item).
-- Overall status: verified, partial, failed, blocked, or invalid.
-
-## Research Map
-
-After improvement runs, the Supervisor Verification Agent generates the research map using all verifier summaries, the experiment ledger, and each path's artifact record.
-
-The research map includes:
-
-- Promising directions.
-- Dead ends.
-- Inconclusive runs.
-- Bugs or confounders.
-- Next recommended experiment.
-- Evidence quality for each result.
-- Compute cost for each path.
-- Expected next-step value.
-
-Example structure:
-
-```text
-Research Map
-
-Promising:
-- Path 2 improved validation accuracy by 2.1 points with no metric change.
-
-Dead Ends:
-- Path 1 changed architecture depth but caused unstable training.
-
-Inconclusive:
-- Path 3 may improve results, but run budget was too small.
-
-Recommended Next Experiment:
-- Re-run Path 2 with 3 seeds and full training budget.
-```
+After improvement runs, the Supervisor generates a research map from all verifier summaries, the experiment ledger, and each path's artifacts. It includes: promising directions, dead ends, inconclusive runs, bugs/confounders, next recommended experiment, evidence quality, compute cost, and expected next-step value.
 
 ## MVP Plan
 
@@ -2642,11 +2492,11 @@ Resolved questions are marked with their decision.
 10. ~~How much of the UI should be built for the hackathon versus generated reports?~~ **Resolved: Full Next.js agent lab dashboard — real-time agent topology, reasoning streams, inter-agent messages, citation explorer, pipeline progress, and data panels. See UX Requirements section.**
 11. ~~Which context backend should the MVP use?~~ **Resolved: Two-layer strategy — RLM Context REPL as primary exploration (programmatic, recursive), Chroma Semantic Index as fallback and fuzzy discovery. SQLite for metadata. RLM based on [arXiv:2512.24601](https://arxiv.org/abs/2512.24601).**
 12. How deep should field history go for MVP: paper only, 1-hop citation graph, or 2-hop citation graph? (Suggested: 1-hop, hand-curated `field_context.md` for the two demo papers.)
-13. Which sources should count as primary enough to resolve an ambiguity without human approval?
+13. ~~Which sources should count as primary enough to resolve an ambiguity without human approval?~~ **Resolved: Sources at trust levels 1-4 (paper, official repo tag, official main branch, author comments) can resolve ambiguities without human approval. Levels 5-7 require verification review. Levels 8-10 require human approval. Agents also use `web_search()` and `notebook_query()` (Google NotebookLM) to find additional evidence for ambiguity resolution.**
 14. ~~Should retrieval citations be required for every agent decision or only high-impact decisions?~~ **Resolved: Every decision. Citations are mandatory for all agent decisions, not just high-impact ones. Uncited decisions are flagged as warnings. See Mandatory Citation Policy section.**
 15. ~~What papers should be included in the internal ReproLab benchmark suite?~~ **Resolved: PPO and MixMatch are the first two. Expand in Phase 2.**
 16. What sandbox network policy should be used by default during build and run stages? (Suggested: allow network during build, block during run except approved dataset downloads.)
-17. Is the 7-level source-of-truth priority defined in Paper And Repository Contradiction Handling approved by the team, or does it need adjustment?
+17. ~~Is the 7-level source-of-truth priority defined in Paper And Repository Contradiction Handling approved by the team, or does it need adjustment?~~ **Resolved: Expanded to 10 levels. Added: level 5 (papers cited as methodological basis), level 7 (later papers that reproduce/cite), level 9 (field conventions and benchmark standards). See Paper And Repository Contradiction Handling section.**
 18. What minimum seed count is required before calling an improvement verified in production? (Suggested: 3 seeds for production; 1 seed clearly labeled for hackathon.)
 19. What license states should block work versus require user approval?
 20. What resource limits should local Docker sandboxes enforce by default? (Suggested: 4 CPU, 8 GB RAM, 20 GB disk, 30-minute wall-clock timeout.)
