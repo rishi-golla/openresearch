@@ -51,7 +51,7 @@ describe("POST /api/demo", () => {
     );
 
     expect(response.status).toBe(202);
-    expect(startDemoRun).toHaveBeenCalledWith("sdk", "anthropic", "efficient", "local", {
+    expect(startDemoRun).toHaveBeenCalledWith("sdk", "anthropic", "efficient", "auto", {
       uploadedPaper: expect.objectContaining({
         fileName: "paper.pdf"
       })
