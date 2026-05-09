@@ -8,4 +8,11 @@ describe("landing page", () => {
 
     expect(screen.getByText(/work smarter\. move faster\./i)).toBeInTheDocument();
   });
+
+  it("renders the navigation and primary CTA", () => {
+    render(<HomePage />);
+
+    expect(screen.getByText("Stellar.ai")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /begin free trial/i })).toBeInTheDocument();
+  });
 });
