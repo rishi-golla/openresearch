@@ -843,6 +843,31 @@ PRD changes made:
 
 Also in this conversation: docs moved from project root to `docs/` folder and pushed to GitHub.
 
+## 13. Open Questions Answered: UI, Citations, Confidence
+
+### User
+
+The user answered three open questions:
+
+1. **Q10 (UI):** Build a full Next.js agent lab dashboard, not just terminal output. The user wants to see their "lab of agents" working — agent topology, reasoning streams, subagent relationships, inter-agent messages, and how they work. Real-time.
+2. **Q14 (Citations):** Citations are very important. Required for every decision, not just high-impact ones. Be very careful with citations.
+3. **Q8 (Confidence threshold):** Should be variable/dynamic — depends on the actual result being verified, not a predefined number.
+
+### Assistant
+
+The assistant updated the PRD:
+
+- **UX Requirements** rewritten from a simple bullet list to a full **Next.js Agent Lab Dashboard** spec: live agent topology view, agent reasoning stream, inter-agent message feed, citation explorer, pipeline progress, data panels, and real-time WebSocket/SSE event architecture.
+- **Technology Stack** updated with Next.js, WebSocket/SSE, and TypeScript.
+- **Mandatory Citation Policy** added as a new subsection: every decision must include citations, uncited decisions flagged as warnings, citation format defined, verifiers reject uncited findings.
+- **Citation Explorer** added to the dashboard: click-through to source, trust level badges, exploration audit trail, uncited warnings.
+- **Dynamic Confidence Threshold** added as a new top-level section: verifiers assess complexity, risk, and evidence quality of each item, then set the threshold dynamically with recorded reasoning. Factors that raise/lower the threshold. Supervisor can override.
+- **Exploration Audit Trail** updated to require full citations for every decision.
+- **Reproducibility Score** updated to include dynamic confidence thresholds.
+- **Backend Services** updated with `event_stream` and `citation_tracker` modules.
+- **Open Questions** 8, 10, and 14 marked resolved.
+- **Chat Requirements Traceability** updated with three new rows.
+
 ## Current Artifacts
 
 ### Product PRD

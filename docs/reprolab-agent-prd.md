@@ -45,6 +45,9 @@ This section verifies that the PRD reflects the key product decisions from the p
 | Define how agents communicate and pass structured outputs to each other. | Inter-Agent Communication Protocol, Context Management. | Captured |
 | Consider graph-based context (Graphify) for structural code/paper analysis. | Knowledge Graph (Storage Layers), Technology Stack, Production Roadmap Phase 2. | Captured |
 | Consider blackboard architecture for production-scale agent coordination. | Production Roadmap Phase 3. | Captured |
+| Build a Next.js agent lab dashboard showing agents, reasoning, messages, and citations in real time. | UX Requirements, Technology Stack. | Captured |
+| Make citations mandatory for every agent decision, not optional. | Mandatory Citation Policy, Exploration Audit Trail, UX Requirements (Citation Explorer). | Captured |
+| Use dynamic confidence thresholds based on actual result complexity, not fixed numbers. | Dynamic Confidence Threshold, Reproducibility Score. | Captured |
 | Add production-grade trust, safety, versioning, cost, and evaluation controls. | Trust, Safety, And Evaluation, Implementation Details, Success Metrics. | Captured |
 
 Unresolved items from the conversation are intentionally preserved as open product questions: the first demo paper, exact runtime budget, dataset-size threshold, GPU cost threshold, verifier voting rules, and the confidence threshold for labeling a result verified.
@@ -134,8 +137,10 @@ These decisions are locked for the hackathon build. They are not open questions.
 | Knowledge graph (Layer 3, Phase 2) | [Graphify](https://github.com/safishamsi/graphify) | Structural knowledge graph from code + docs + papers via Tree-sitter AST + LLM semantic extraction; NetworkX + Leiden community detection; ~1.7k tokens/query vs ~123k naive (71.5x reduction) |
 | RLM implementation | [alexzhang13/rlm](https://github.com/alexzhang13/rlm) or [ysz/recursive-llm](https://github.com/ysz/recursive-llm) | Official and community implementations; LiteLLM-based, works with Claude via API |
 | Metadata store | SQLite | Zero-config, file-based, sufficient for single-machine MVP |
+| Frontend | Next.js (React) | Real-time agent lab dashboard showing agent topology, reasoning, messages, and citations |
+| Real-time events | WebSocket or SSE from Python backend to Next.js frontend | Stream agent activity, reasoning steps, and inter-agent messages as they happen |
 | Container runtime | Docker (local) | Sandbox isolation; cloud GPU deferred to Phase 3 |
-| Language | Python 3.11 | Compatible with all dependencies for both demo papers |
+| Language | Python 3.11 (backend), TypeScript (frontend) | Compatible with all dependencies for both demo papers |
 
 ### Claude Agent SDK Patterns
 
@@ -1487,22 +1492,64 @@ Confidence: medium
 Assumption risk: medium
 ```
 
+### Mandatory Citation Policy
+
+**Every agent decision must include citations.** This is not optional and not limited to high-impact decisions. Citations are a core product feature — they make ReproLab's work trustworthy and auditable.
+
+Rules:
+
+- Every assumption must cite the source(s) that informed it.
+- Every decision must cite the evidence that supports it.
+- Every verification judgment must cite the artifacts and sources it checked.
+- Uncited decisions are flagged as warnings in the dashboard.
+- Verifier agents should reject findings that lack citations.
+- The Supervisor should treat uncited claims as lower confidence.
+
+Citation format:
+
+```json
+{
+  "decision": "Use Adam optimizer with lr=3e-4",
+  "citations": [
+    {
+      "source_id": "src_001",
+      "source_type": "paper_section",
+      "source_path": "paper.pdf § Training Details",
+      "trust_level": "primary",
+      "relevant_quote": "We train with Adam (Kingma & Ba, 2015) using a learning rate of 3×10⁻⁴.",
+      "retrieved_via": "rlm_query"
+    },
+    {
+      "source_id": "src_014",
+      "source_type": "repo_file",
+      "source_path": "configs/default.yaml",
+      "trust_level": "primary",
+      "relevant_quote": "optimizer: adam\nlr: 0.0003",
+      "retrieved_via": "repl_code"
+    }
+  ],
+  "citation_coverage": "strong",
+  "uncited_aspects": []
+}
+```
+
 ### Exploration Audit Trail
 
-Every important agent decision should log:
+**Every** agent decision must log:
 
 - Agent ID.
 - REPL code executed (exploration steps).
 - `rlm_query()` sub-calls made (question, context segment, answer).
 - `semantic_search()` fallback queries (query, top-k results, why RLM was insufficient).
 - Variables accessed.
-- Evidence extracted (from both RLM and semantic layers).
+- Evidence extracted (from all layers: RLM, semantic, knowledge graph).
+- **Full citations for the decision** (source IDs, trust levels, relevant quotes, retrieval method).
 - Decision made.
 - Confidence.
 - Assumption created or updated.
 - Verifier review status.
 
-This prevents "exploration for vibes" and makes context usage auditable. The RLM layer produces naturally transparent audit trails (explicit code), while semantic search queries are logged with the reason the agent fell back to fuzzy retrieval.
+This prevents "exploration for vibes" and makes context usage auditable. The RLM layer produces naturally transparent audit trails (explicit code), while semantic search queries are logged with the reason the agent fell back to fuzzy retrieval. Every decision in the audit trail links back to specific sources visible in the dashboard's Citation Explorer.
 
 ### MVP Implementation Recommendation
 
@@ -2052,6 +2099,71 @@ runs/
 }
 ```
 
+## Dynamic Confidence Threshold
+
+The confidence threshold for labeling a result "verified" is **not a fixed number**. It is dynamically determined by the verifier agents based on the actual result being evaluated.
+
+### Why Dynamic
+
+A fixed threshold (e.g., "85% = verified") treats all results equally. But:
+
+- Reproducing a simple config value (batch_size=64 from a config file) needs low confidence to verify.
+- Reproducing a novel loss function from a paper's equation needs very high confidence.
+- An improvement that changes one hyperparameter needs less scrutiny than one that rewrites the architecture.
+- A result backed by 5 primary sources needs a lower threshold than one backed by 1 weak source.
+
+### How It Works
+
+Each verifier agent assesses the **complexity, risk, and evidence quality** of what it is verifying, then sets an appropriate confidence bar and explains why.
+
+```json
+{
+  "verification_item": "optimizer_choice",
+  "assessed_complexity": "low",
+  "assessed_risk": "medium",
+  "evidence_quality": "strong",
+  "dynamic_threshold": 70,
+  "threshold_reasoning": "Optimizer is explicitly stated in paper and config file agrees. Medium risk because paper says Adam but an older commit used SGD.",
+  "actual_confidence": 88,
+  "verdict": "verified"
+}
+```
+
+```json
+{
+  "verification_item": "custom_loss_function",
+  "assessed_complexity": "high",
+  "assessed_risk": "high",
+  "evidence_quality": "medium",
+  "dynamic_threshold": 92,
+  "threshold_reasoning": "Novel loss function with custom gradient computation. Equation in paper is ambiguous about the denominator. High risk of subtle implementation error.",
+  "actual_confidence": 78,
+  "verdict": "caveated",
+  "caveat": "Loss function implementation matches equation but denominator interpretation is an assumption."
+}
+```
+
+### Factors That Raise The Threshold
+
+- Novel or complex algorithms.
+- Ambiguous paper descriptions.
+- No reference implementation available.
+- Weak or contradictory evidence.
+- High assumption count in this area.
+- Result sensitivity to this component (e.g., wrong learning rate schedule ruins everything).
+
+### Factors That Lower The Threshold
+
+- Exact match with reference code.
+- Multiple primary sources agree.
+- Standard well-known technique.
+- Low sensitivity (e.g., logging frequency).
+- Config file explicitly states the value.
+
+### Supervisor Override
+
+The Supervisor Verification Agent reviews each verifier's dynamic threshold and can override it (raise or lower) with recorded reasoning. The final threshold and its justification are included in the verification report and visible in the dashboard.
+
 ## Reproducibility Score
 
 Final score should include:
@@ -2062,6 +2174,7 @@ Final score should include:
 - Metric validity: 0-100.
 - Artifact completeness: 0-100.
 - Assumption risk: low, medium, or high.
+- Dynamic confidence thresholds used (per verification item).
 - Overall status: verified, partial, failed, blocked, or invalid.
 
 ## Research Map
@@ -2239,6 +2352,8 @@ Recommended backend modules:
 - `safety_monitor`: enforces resource limits, network controls, and sandbox lifecycle rules.
 - `license_scanner`: tracks code, dataset, model, and artifact license constraints.
 - `evaluation_harness`: runs ReproLab against the internal agent benchmark suite.
+- `event_stream`: emits real-time events (agent activity, reasoning steps, messages, citations) via WebSocket/SSE to the Next.js dashboard.
+- `citation_tracker`: enforces mandatory citation policy, flags uncited decisions, aggregates citation coverage per agent.
 - `remote_runner`: later supports SSH and cloud GPU execution.
 
 ### Suggested Data Model
@@ -2317,25 +2432,99 @@ The system should:
 
 ## UX Requirements
 
-The user should be able to see:
+The frontend is a **Next.js agent lab dashboard** — a real-time view into the "lab of agents" working. The user should feel like they're watching a research team operate, seeing the reasoning, the debates, the evidence, and the decisions as they happen.
 
-- Current reproduction stage.
-- Agent activity.
-- Pending approvals.
-- Extracted paper claims.
-- Assumption ledger.
+### Agent Lab Dashboard (Next.js)
+
+#### Live Agent Topology View
+
+A real-time graph/node visualization showing:
+
+- All active agents as nodes (color-coded by type: builder, verifier, improvement, supervisor).
+- Parent-child relationships (orchestrator → subagents).
+- Current status of each agent (idle, running, waiting, completed, failed).
+- Data flow edges showing which agent's output feeds into which agent's input.
+- Progressive context enrichment — visual indication of REPL variables being added as agents complete.
+
+#### Agent Reasoning Stream
+
+For each agent, a live panel showing:
+
+- The agent's current task and scoped prompt.
+- Reasoning steps as they happen (streamed via WebSocket/SSE).
+- REPL code being executed (RLM exploration steps).
+- `rlm_query()` sub-calls and their results.
+- `semantic_search()` fallback queries and why they were triggered.
+- **Citations inline** — every piece of evidence linked to its source with trust level.
+
+#### Inter-Agent Message Feed
+
+A chronological feed showing:
+
+- Structured messages flowing between agents and the orchestrator.
+- What each agent received as input and what it returned as output.
+- Progressive context enrichment events (new REPL variable added).
+- Shared state updates (assumption created, decision logged, ledger entry appended).
+
+#### Citation Explorer
+
+Citations are first-class UI elements:
+
+- Every agent decision shows its evidence chain: source → retrieved evidence → decision.
+- Click any citation to see the original source (paper section, config file, GitHub issue, etc.).
+- Trust level badges on every citation (primary, strong_secondary, secondary, weak).
+- Exploration audit trail — full log of what the agent explored and what it cited.
+- Highlight uncited decisions as warnings.
+
+#### Pipeline Progress
+
+- Current reproduction stage with gate status (Plan → Baseline → Improvement).
+- Verification gate results with pass/fail/caveat details.
+- Pending human approvals.
+
+#### Data Panels
+
+- Extracted paper claims (Paper Claim Map).
+- Assumption ledger with risk levels and evidence.
 - Docker/environment status.
-- Run logs.
-- Metrics and plots.
-- Verification status.
-- Improvement path comparison.
-- Research map.
-- Source confidence and trust state.
+- Run logs (streamable).
+- Metrics and plots (rendered inline).
+- Improvement path comparison (side-by-side metrics, diffs).
+- Research map (final synthesis).
 - Contradictions between paper, repository, and field history.
-- Comparability contract status.
+- Dynamic confidence scores with reasoning (see Dynamic Confidence Threshold below).
 - Provenance manifest.
 - Budget estimate and actual cost.
 - License and data-rights status.
+
+#### Real-Time Architecture
+
+The Python backend (agent orchestrator) emits events via WebSocket or SSE:
+
+```json
+{
+  "event": "agent_reasoning_step",
+  "agent_id": "environment_detective",
+  "timestamp": "2026-05-08T22:15:03Z",
+  "step_type": "rlm_query",
+  "query": "What CUDA version is discussed?",
+  "context_segment": "github_issues[14]",
+  "result": "CUDA 11.3 confirmed working, CUDA 12 fails",
+  "citations": [
+    {"source_id": "src_042", "trust_level": "secondary", "content": "Issue #14 body"}
+  ]
+}
+```
+
+Event types to stream:
+
+- `agent_started`, `agent_completed`, `agent_failed`
+- `agent_reasoning_step` (each exploration step with citations)
+- `rlm_query_executed`, `semantic_search_executed`
+- `shared_state_updated` (new assumption, decision, REPL variable)
+- `verification_gate_result`
+- `approval_requested`, `approval_resolved`
+- `context_enrichment` (new REPL variable added by completed agent)
 
 The UX should make uncertainty visible. It should not pretend the system knows more than it does.
 
@@ -2433,13 +2622,13 @@ Resolved questions are marked with their decision.
 5. ~~Should the product support only papers with public datasets at first?~~ **Resolved: Yes. Both demo papers use public datasets.**
 6. Should initial improvement paths always be three, or user-configurable? (Suggested: hardcode 3 for hackathon.)
 7. ~~Should verifier agents use a voting system, supervisor override, or strict veto power?~~ **Resolved: Supervisor has full override authority. No voting. All verifier findings are advisory. Supervisor decision is final and must include recorded reasoning. See Supervisor Verification Agent section.**
-8. What confidence threshold is required before labeling a result verified?
+8. ~~What confidence threshold is required before labeling a result verified?~~ **Resolved: Dynamic — verifier agents assess the complexity, risk, and evidence quality of each item and set the threshold accordingly. No fixed number. See Dynamic Confidence Threshold section.**
 9. ~~Should the system prioritize exact reproduction or fast partial reproduction for demo?~~ **Resolved: Fast partial reproduction with clearly labeled reduced runs.**
-10. How much of the UI should be built for the hackathon versus generated reports? (Suggested: terminal output + final `report.md` only.)
+10. ~~How much of the UI should be built for the hackathon versus generated reports?~~ **Resolved: Full Next.js agent lab dashboard — real-time agent topology, reasoning streams, inter-agent messages, citation explorer, pipeline progress, and data panels. See UX Requirements section.**
 11. ~~Which context backend should the MVP use?~~ **Resolved: Two-layer strategy — RLM Context REPL as primary exploration (programmatic, recursive), Chroma Semantic Index as fallback and fuzzy discovery. SQLite for metadata. RLM based on [arXiv:2512.24601](https://arxiv.org/abs/2512.24601).**
 12. How deep should field history go for MVP: paper only, 1-hop citation graph, or 2-hop citation graph? (Suggested: 1-hop, hand-curated `field_context.md` for the two demo papers.)
 13. Which sources should count as primary enough to resolve an ambiguity without human approval?
-14. Should retrieval citations be required for every agent decision or only high-impact decisions?
+14. ~~Should retrieval citations be required for every agent decision or only high-impact decisions?~~ **Resolved: Every decision. Citations are mandatory for all agent decisions, not just high-impact ones. Uncited decisions are flagged as warnings. See Mandatory Citation Policy section.**
 15. ~~What papers should be included in the internal ReproLab benchmark suite?~~ **Resolved: PPO and MixMatch are the first two. Expand in Phase 2.**
 16. What sandbox network policy should be used by default during build and run stages? (Suggested: allow network during build, block during run except approved dataset downloads.)
 17. Is the 7-level source-of-truth priority defined in Paper And Repository Contradiction Handling approved by the team, or does it need adjustment?
