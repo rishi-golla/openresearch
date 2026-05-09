@@ -64,6 +64,8 @@ function formatStatus(status: LiveDemoRunState["status"] | "idle") {
       return "Queued";
     case "running":
       return "Running";
+    case "stopped":
+      return "Stopped";
     case "completed":
       return "Completed";
     case "failed":
@@ -79,6 +81,8 @@ function statusTone(status: LiveDemoRunState["status"] | "idle") {
       return "border-amber-300/30 bg-amber-300/10 text-amber-100";
     case "running":
       return "border-sky-300/30 bg-sky-300/10 text-sky-100";
+    case "stopped":
+      return "border-stone-300/30 bg-stone-300/10 text-stone-100";
     case "completed":
       return "border-emerald-300/30 bg-emerald-300/10 text-emerald-100";
     case "failed":
@@ -142,6 +146,7 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
   const [sandboxMode, setSandboxMode] = useState<DemoSandboxMode>(
     initialRun?.sandboxMode ?? "local"
   );
+  const [selectedPaper, setSelectedPaper] = useState<File | null>(null);
   const [runningMode, setRunningMode] = useState<"offline" | "sdk" | null>(
     initialRun && (initialRun.status === "queued" || initialRun.status === "running")
       ? initialRun.runMode
@@ -244,6 +249,70 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
     }
   }
 
+  async function handleUploadedRun(mode: "offline" | "sdk") {
+    if (!selectedPaper) {
+      setError("Choose a PDF before starting an uploaded-paper run.");
+      return;
+    }
+
+    setRunningMode(mode);
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.set("mode", mode);
+      formData.set("paper", selectedPaper);
+      formData.set("executionMode", executionMode);
+      formData.set("sandbox", sandboxMode);
+      if (mode === "sdk") {
+        formData.set("provider", sdkProvider);
+      }
+
+      const response = await fetch("/api/demo", {
+        method: "POST",
+        body: formData
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error ?? `Demo run failed with status ${response.status}`);
+      }
+
+      const next = (await response.json()) as LiveDemoRunState;
+      setRun(next);
+    } catch (runError) {
+      setRunningMode(null);
+      setError(runError instanceof Error ? runError.message : "Demo run failed");
+    }
+  }
+
+  async function handleStop() {
+    if (!run || (run.status !== "queued" && run.status !== "running")) {
+      return;
+    }
+
+    setError(null);
+
+    try {
+      const providerParam =
+        run.runMode === "sdk" && run.llmProvider ? `&provider=${run.llmProvider}` : "";
+      const executionParam = run.executionMode ? `&executionMode=${run.executionMode}` : "";
+      const sandboxParam = run.sandboxMode ? `&sandbox=${run.sandboxMode}` : "";
+      const response = await fetch(
+        `/api/demo?projectId=${run.projectId}&mode=${run.runMode}${providerParam}${executionParam}${sandboxParam}`,
+        { method: "DELETE" }
+      );
+      if (!response.ok) {
+        throw new Error(`Stop request failed with status ${response.status}`);
+      }
+
+      const next = (await response.json()) as LiveDemoRunState | null;
+      setRun(next);
+      setRunningMode(null);
+    } catch (stopError) {
+      setError(stopError instanceof Error ? stopError.message : "Unable to stop demo run");
+    }
+  }
+
   const currentStatus = run?.status ?? "idle";
   const currentPayload = run?.payload;
   const currentStage = currentPayload?.summary.stage ?? "not started";
@@ -320,6 +389,97 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
               >
                 {runningMode === "sdk" ? "Starting SDK run..." : "Run SDK"}
               </button>
+              <button
+                className="inline-flex flex-1 items-center justify-center rounded-full border border-rose-300/35 bg-rose-400/10 px-5 py-3 text-sm font-semibold text-rose-100 transition hover:border-rose-200 hover:bg-rose-400/20 disabled:cursor-not-allowed disabled:border-stone-700 disabled:text-stone-500"
+                disabled={!run || (run.status !== "queued" && run.status !== "running")}
+                onClick={() => void handleStop()}
+                type="button"
+              >
+                Stop current run
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-6 rounded-[24px] border border-white/10 bg-white/5 p-5">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div className="max-w-2xl">
+              <p className="text-xs uppercase tracking-[0.28em] text-stone-400">
+                Upload paper
+              </p>
+              <h2 className="mt-2 text-xl font-semibold text-white">
+                Start a lab run from your own PDF
+              </h2>
+              <p className="mt-2 text-sm leading-6 text-stone-300">
+                Upload a paper here to run the same lab flow from a real PDF source
+                instead of the built-in PPO fixture.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-3">
+              <button
+                className="inline-flex items-center justify-center rounded-full bg-emerald-400 px-5 py-2.5 text-sm font-semibold text-stone-950 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:bg-stone-700 disabled:text-stone-300"
+                disabled={runningMode !== null || !selectedPaper}
+                onClick={() => void handleUploadedRun("offline")}
+                type="button"
+              >
+                {runningMode === "offline" && selectedPaper
+                  ? "Starting uploaded offline run..."
+                  : "Run uploaded paper (offline)"}
+              </button>
+              <button
+                className="inline-flex items-center justify-center rounded-full border border-emerald-300/40 bg-transparent px-5 py-2.5 text-sm font-semibold text-emerald-100 transition hover:border-emerald-200 hover:bg-emerald-300/10 disabled:cursor-not-allowed disabled:border-stone-700 disabled:text-stone-500"
+                disabled={runningMode !== null || !selectedPaper}
+                onClick={() => void handleUploadedRun("sdk")}
+                type="button"
+              >
+                {runningMode === "sdk" && selectedPaper
+                  ? "Starting uploaded SDK run..."
+                  : "Run uploaded paper (SDK)"}
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-4 flex flex-col gap-3 rounded-2xl border border-dashed border-emerald-300/25 bg-stone-950/40 p-4 md:flex-row md:items-center md:justify-between">
+            <div>
+              <label
+                className="text-sm font-medium text-white"
+                htmlFor="lab-paper-upload"
+              >
+                Upload paper PDF
+              </label>
+              <p className="mt-1 text-sm text-stone-400">
+                One PDF only. The lab will route it through the repo&apos;s paper
+                ingestion pipeline.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <input
+                accept="application/pdf,.pdf"
+                className="block text-sm text-stone-200 file:mr-4 file:rounded-full file:border-0 file:bg-emerald-400 file:px-4 file:py-2 file:font-semibold file:text-stone-950 hover:file:bg-emerald-300"
+                id="lab-paper-upload"
+                onChange={(event) =>
+                  setSelectedPaper(event.target.files?.[0] ?? null)
+                }
+                type="file"
+              />
+              {selectedPaper ? (
+                <>
+                  <span className="rounded-full border border-emerald-300/20 bg-emerald-300/10 px-3 py-1 text-xs font-medium text-emerald-100">
+                    {selectedPaper.name}
+                  </span>
+                  <button
+                    className="text-sm text-stone-300 underline decoration-stone-500 underline-offset-4 hover:text-white"
+                    onClick={() => setSelectedPaper(null)}
+                    type="button"
+                  >
+                    Clear
+                  </button>
+                </>
+              ) : (
+                <span className="text-sm text-stone-400">No PDF selected yet.</span>
+              )}
             </div>
           </div>
         </div>
@@ -335,6 +495,12 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
             {run.runMode === "sdk"
               ? `The ${activeProviderLabel} SDK pipeline is running with ${activeExecutionLabel.toLowerCase()} profile and ${activeSandboxLabel.toLowerCase()} execution. This page refreshes checkpoints every few seconds.`
               : `The offline demo is running with ${activeExecutionLabel.toLowerCase()} profile and ${activeSandboxLabel.toLowerCase()} execution. This page refreshes checkpoints every few seconds.`}
+          </div>
+        ) : null}
+
+        {currentStatus === "stopped" && run ? (
+          <div className="mt-6 rounded-2xl border border-stone-300/20 bg-stone-300/10 px-4 py-3 text-sm text-stone-100">
+            This run was stopped from the lab page. You can start a fresh SDK or offline run whenever you want.
           </div>
         ) : null}
 
@@ -365,10 +531,11 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
           <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
             <p className="text-xs uppercase tracking-[0.28em] text-stone-400">Source</p>
             <p className="mt-2 text-lg font-medium text-white">
-              {currentPayload?.summary.sourceLabel ?? "No run yet"}
+              {currentPayload?.summary.sourceLabel ?? run?.sourceLabel ?? "No run yet"}
             </p>
             <p className="mt-2 text-sm leading-6 text-stone-400">
               {currentPayload?.sourceNote ??
+                run?.sourceNote ??
                 "Start a run to populate the dashboard from a real pipeline execution."}
             </p>
           </div>

@@ -1,6 +1,11 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { LiveDemoClient } from "./live-demo-client";
+
+vi.mock("@/features/dashboard/dashboard-shell", () => ({
+  DashboardShell: () => <div>dashboard shell</div>
+}));
 
 describe("LiveDemoClient", () => {
   afterEach(() => {
@@ -44,5 +49,58 @@ describe("LiveDemoClient", () => {
         }
       );
     });
+  });
+
+  it("shows the selected pdf name and posts provider form data for uploaded sdk runs", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        projectId: "prj_upload",
+        outputDir: "runs/prj_upload",
+        runMode: "sdk",
+        llmProvider: "openai",
+        status: "queued",
+        payload: null,
+        log: ""
+      })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<LiveDemoClient initialRun={null} />);
+
+    fireEvent.change(screen.getByLabelText(/sdk provider/i), {
+      target: { value: "openai" }
+    });
+    fireEvent.change(screen.getByLabelText(/profile/i), {
+      target: { value: "max" }
+    });
+    fireEvent.change(screen.getByLabelText(/sandbox/i), {
+      target: { value: "docker" }
+    });
+
+    const input = screen.getByLabelText("Upload paper PDF");
+    const file = new File(["%PDF-demo"], "ppo-paper.pdf", {
+      type: "application/pdf"
+    });
+
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(screen.getByText("ppo-paper.pdf")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run uploaded paper (SDK)" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/demo");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeInstanceOf(FormData);
+
+    const formData = init.body as FormData;
+    expect(formData.get("mode")).toBe("sdk");
+    expect(formData.get("provider")).toBe("openai");
+    expect(formData.get("executionMode")).toBe("max");
+    expect(formData.get("sandbox")).toBe("docker");
+    expect(formData.get("paper")).toBe(file);
   });
 });

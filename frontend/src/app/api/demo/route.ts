@@ -5,7 +5,7 @@ import type {
   DemoProvider,
   DemoSandboxMode
 } from "@/lib/demo/demo-run-types";
-import { loadDemoRun, startDemoRun } from "@/lib/demo/node-runner";
+import { loadDemoRun, startDemoRun, stopDemoRun } from "@/lib/demo/node-runner";
 
 export const runtime = "nodejs";
 
@@ -64,6 +64,60 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    const contentType = request.headers.get("content-type") ?? "";
+    if (contentType.includes("multipart/form-data")) {
+      const formData = await request.formData();
+      const paper = formData.get("paper");
+      const mode = formData.get("mode");
+      const provider = formData.get("provider");
+      const executionMode = formData.get("executionMode");
+      const sandboxMode = formData.get("sandbox");
+      const runMode = mode === "sdk" || mode === "offline" ? mode : "offline";
+      const llmProvider =
+        provider === "anthropic" || provider === "openai"
+          ? provider
+          : toProvider(request) ?? "anthropic";
+      const runExecutionMode =
+        executionMode === "efficient" || executionMode === "max"
+          ? executionMode
+          : toExecutionMode(request) ?? "efficient";
+      const runSandboxMode =
+        sandboxMode === "local" || sandboxMode === "docker"
+          ? sandboxMode
+          : toSandboxMode(request) ?? "local";
+
+      if (!(paper instanceof File) || paper.size === 0) {
+        return NextResponse.json(
+          { error: "Upload a PDF before starting a lab run." },
+          { status: 400 }
+        );
+      }
+
+      const looksLikePdf =
+        paper.type === "application/pdf" || paper.name.toLowerCase().endsWith(".pdf");
+      if (!looksLikePdf) {
+        return NextResponse.json(
+          { error: "Only PDF uploads are supported in the lab right now." },
+          { status: 400 }
+        );
+      }
+
+      const bytes = new Uint8Array(await paper.arrayBuffer());
+      const run = await startDemoRun(
+        runMode,
+        llmProvider,
+        runExecutionMode,
+        runSandboxMode,
+        {
+          uploadedPaper: {
+            fileName: paper.name,
+            bytes
+          }
+        }
+      );
+      return NextResponse.json(run, { status: 202 });
+    }
+
     const run = await startDemoRun(
       toRunMode(request) ?? "offline",
       toProvider(request) ?? "anthropic",
@@ -73,6 +127,22 @@ export async function POST(request: Request) {
     return NextResponse.json(run, { status: 202 });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Demo pipeline failed";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+export async function DELETE(request: Request) {
+  try {
+    const run = await stopDemoRun(
+      toRunMode(request) ?? "offline",
+      toProjectId(request),
+      toProvider(request),
+      toExecutionMode(request),
+      toSandboxMode(request)
+    );
+    return NextResponse.json(run);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to stop demo pipeline";
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
