@@ -295,6 +295,28 @@ class ReproLabOrchestrator:
                     vs["score"] = vs["score"] / 100.0
         return data
 
+    def _normalize_reproduction_contract(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize planner output so it can be parsed into ReproductionContract."""
+        if (
+            "expected_outputs" in data
+            and isinstance(data["expected_outputs"], list)
+            and data["expected_outputs"]
+            and isinstance(data["expected_outputs"][0], dict)
+        ):
+            normalized_outputs: list[str] = []
+            for item in data["expected_outputs"]:
+                if isinstance(item, dict):
+                    normalized_outputs.append(
+                        item.get("path")
+                        or item.get("name")
+                        or item.get("label")
+                        or json.dumps(item, sort_keys=True)
+                    )
+                else:
+                    normalized_outputs.append(str(item))
+            data["expected_outputs"] = normalized_outputs
+        return data
+
     def _extract_json(self, text: str, fallback_file: str | None = None) -> dict[str, Any]:
         """Extract JSON from agent output, handling markdown fences.
 
@@ -417,8 +439,10 @@ class ReproLabOrchestrator:
             f"Write reproduction_contract.json to {self._project_dir}/"
         )
         output = await self._invoke_agent("reproduction-planner", prompt)
-        data = self._extract_json(
-            output, fallback_file=str(self._project_dir / "reproduction_contract.json"),
+        data = self._normalize_reproduction_contract(
+            self._extract_json(
+                output, fallback_file=str(self._project_dir / "reproduction_contract.json"),
+            )
         )
         state.reproduction_contract = ReproductionContract(**data)
         state.stage = PipelineStage.PLAN_CREATED
