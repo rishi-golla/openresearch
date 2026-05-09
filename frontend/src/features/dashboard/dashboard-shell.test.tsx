@@ -12,6 +12,10 @@ describe("DashboardShell", () => {
     expect(screen.getByRole("heading", { name: "Agent Lab" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Topology" })).toBeInTheDocument();
     expect(
+      screen.getByRole("heading", { name: "Hermes Verification" })
+    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Consistency Regularization" })).toBeInTheDocument();
+    expect(
       screen.getByRole("heading", { name: "Reasoning Stream" })
     ).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Messages" })).toBeInTheDocument();

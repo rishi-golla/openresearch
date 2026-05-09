@@ -2,6 +2,8 @@ import type {
   AgentNode,
   DashboardEvent,
   DashboardSnapshot,
+  HermesPanel,
+  ConceptCard,
   ProgressStatus
 } from "@/lib/events/contract";
 import type {
@@ -52,6 +54,10 @@ interface BaselineResultLike {
   assumptions_applied?: string[];
 }
 
+interface ReproductionContractLike {
+  reproduction_definition?: string;
+}
+
 interface ExperimentArtifactsLike {
   success?: boolean;
   metrics?: Record<string, unknown>;
@@ -78,11 +84,49 @@ interface ResearchMapLike {
   overall_reproducibility_assessment?: string;
 }
 
+type HermesAuditScopeLike = "step" | "checkpoint";
+type HermesAuditStatusLike =
+  | "grounded"
+  | "caveat"
+  | "unsupported"
+  | "unavailable"
+  | "system_error";
+type HermesInterventionLike =
+  | "annotate"
+  | "retry_step"
+  | "request_evidence"
+  | "downgrade_claim"
+  | "suppress_publication"
+  | "escalate_human";
+
+interface HermesEvidenceRefLike {
+  kind?: string;
+  path?: string;
+  snippet?: string;
+  description?: string;
+}
+
+interface HermesAuditReportLike {
+  target?: string;
+  scope?: HermesAuditScopeLike;
+  status?: HermesAuditStatusLike;
+  summary?: string;
+  findings?: string[];
+  unsupported_claims?: string[];
+  evidence_refs?: HermesEvidenceRefLike[];
+  recommended_intervention?: HermesInterventionLike;
+  corrective_note?: string;
+  confidence?: string;
+  provider?: string;
+  error_message?: string;
+}
+
 export interface PipelineStateDocument {
   project_id: string;
   stage: string;
   paper_claim_map?: PaperClaimMapLike;
   environment_spec?: EnvironmentSpecLike;
+  reproduction_contract?: ReproductionContractLike;
   baseline_result?: BaselineResultLike;
   experiment_artifacts?: ExperimentArtifactsLike;
   gate_1?: GateDecisionLike;
@@ -92,12 +136,21 @@ export interface PipelineStateDocument {
   research_map?: ResearchMapLike;
   assumption_ledger?: Array<{ assumption_id?: string }>;
   decision_log?: string[];
+  hermes_step_reports?: Record<string, HermesAuditReportLike[]>;
+  hermes_checkpoint_reports?: Record<string, HermesAuditReportLike[]>;
+  hermes_interventions?: Array<{
+    target?: string;
+    scope?: HermesAuditScopeLike;
+    action?: HermesInterventionLike;
+    reason?: string;
+    status?: HermesAuditStatusLike;
+  }>;
 }
 
 export interface LiveDemoMeta {
   projectId: string;
   outputDir: string;
-  sourceKind: "repo_pdf" | "workspace_fixture";
+  sourceKind: "workspace_fixture" | "uploaded_pdf";
   runMode: "offline" | "sdk";
   llmProvider?: DemoProvider;
   executionMode?: DemoExecutionMode;
@@ -153,6 +206,155 @@ function toStatusTone(status?: GateStatus): ProgressStatus {
   }
 }
 
+function toHermesStatus(
+  status?: HermesAuditStatusLike
+): HermesPanel["overallStatus"] {
+  switch (status) {
+    case "grounded":
+      return "verified";
+    case "caveat":
+      return "caveat";
+    case "unsupported":
+      return "unsupported";
+    case "unavailable":
+    case "system_error":
+      return "caveat";
+    default:
+      return "pending";
+  }
+}
+
+function latestHermesReport(
+  reports?: HermesAuditReportLike[]
+): HermesAuditReportLike | undefined {
+  return reports?.at(-1);
+}
+
+function evidenceLabel(report?: HermesAuditReportLike): string | undefined {
+  const ref = report?.evidence_refs?.[0];
+  if (!ref) {
+    return undefined;
+  }
+  return ref.path || ref.description || ref.snippet || ref.kind;
+}
+
+function reportDetail(
+  report: HermesAuditReportLike | undefined,
+  fallback: string
+): string {
+  if (!report) {
+    return fallback;
+  }
+
+  const unsupported = report.unsupported_claims?.[0];
+  const finding = report.findings?.[0];
+  const intervention = report.recommended_intervention;
+  const parts = [report.summary, unsupported, finding, intervention ? `Action: ${intervention}` : ""]
+    .filter(Boolean);
+
+  return parts.join(" ") || fallback;
+}
+
+function buildHermesPanelFromReports(
+  state: PipelineStateDocument
+): HermesPanel | null {
+  const paperReport = latestHermesReport(state.hermes_step_reports?.["paper-understanding"]);
+  const gate1Report = latestHermesReport(state.hermes_checkpoint_reports?.["gate_1"]);
+  const implementationReport = latestHermesReport(
+    state.hermes_step_reports?.["baseline-implementation"]
+  );
+  const artifactReport =
+    latestHermesReport(state.hermes_checkpoint_reports?.["gate_2"]) ??
+    latestHermesReport(state.hermes_step_reports?.["experiment-runner"]);
+  const improvementReport =
+    latestHermesReport(state.hermes_checkpoint_reports?.["gate_3"]) ??
+    latestHermesReport(state.hermes_checkpoint_reports?.["research_map_generated"]);
+
+  const reports = [
+    paperReport,
+    gate1Report,
+    implementationReport,
+    artifactReport,
+    improvementReport
+  ].filter((report): report is HermesAuditReportLike => Boolean(report));
+
+  if (!reports.length) {
+    return null;
+  }
+
+  const statuses = reports.map((report) => toHermesStatus(report.status));
+  const overallStatus = statuses.includes("unsupported")
+    ? "unsupported"
+    : statuses.includes("caveat")
+      ? "caveat"
+      : statuses.includes("verified")
+        ? "verified"
+        : "checking";
+
+  const interventions = (state.hermes_interventions ?? []).length;
+
+  return {
+    title: "Hermes Verification",
+    summary:
+      interventions > 0
+        ? `Nous Hermes audited this run and recorded ${interventions} intervention${interventions === 1 ? "" : "s"} across steps and checkpoints.`
+        : "Nous Hermes audited this run and did not need to intervene beyond annotations.",
+    overallStatus,
+    checks: [
+      {
+        id: "hermes-concept",
+        label: "Paper concept extracted",
+        detail: reportDetail(
+          paperReport,
+          "Waiting for the paper-understanding audit report."
+        ),
+        status: toHermesStatus(paperReport?.status),
+        evidenceLabel: evidenceLabel(paperReport)
+      },
+      {
+        id: "hermes-grounding",
+        label: "Claim grounded in source text",
+        detail: reportDetail(
+          gate1Report ?? paperReport,
+          "Source grounding will appear after the first checkpoint audit."
+        ),
+        status: toHermesStatus((gate1Report ?? paperReport)?.status),
+        evidenceLabel: evidenceLabel(gate1Report ?? paperReport)
+      },
+      {
+        id: "hermes-implementation",
+        label: "Implementation matches concept",
+        detail: reportDetail(
+          implementationReport,
+          "Implementation evidence is not available yet."
+        ),
+        status: toHermesStatus(implementationReport?.status),
+        evidenceLabel: evidenceLabel(implementationReport)
+      },
+      {
+        id: "hermes-artifacts",
+        label: "Artifacts support reported result",
+        detail: reportDetail(
+          artifactReport,
+          "Artifact verification will appear after the baseline run."
+        ),
+        status: toHermesStatus(artifactReport?.status),
+        evidenceLabel: evidenceLabel(artifactReport)
+      },
+      {
+        id: "hermes-improvement",
+        label: "Improvement claim verified",
+        detail: reportDetail(
+          improvementReport,
+          "Improvement verification unlocks after the final checkpoints."
+        ),
+        status: toHermesStatus(improvementReport?.status),
+        evidenceLabel: evidenceLabel(improvementReport)
+      }
+    ]
+  };
+}
+
 function buildRootAgent(meta: LiveDemoMeta, state: PipelineStateDocument): AgentNode {
   const complete = state.stage === "complete";
 
@@ -172,7 +374,9 @@ function buildRootAgent(meta: LiveDemoMeta, state: PipelineStateDocument): Agent
       "experiment-runner",
       "supervisor-verifier"
     ],
-    contextVariables: [meta.sourceKind === "repo_pdf" ? "raw_paper_pdf" : "ppo_workspace_fixture"]
+    contextVariables: [
+      meta.sourceKind === "uploaded_pdf" ? "raw_paper_pdf" : "ppo_workspace_fixture"
+    ]
   };
 }
 
@@ -220,6 +424,9 @@ function buildInitialSnapshot(
         state.stage === "complete"
       ? "passed"
       : "pending";
+
+  const hermesPanel = buildHermesPanel(state);
+  const conceptCard = buildConceptCard(state);
 
   return {
     agents: [buildRootAgent(meta, state)],
@@ -284,6 +491,161 @@ function buildInitialSnapshot(
           `Improvement paths: ${improvementCount}`,
           `Research map: ${state.research_map ? "available" : "pending"}`
         ]
+      }
+    ],
+    hermesPanel,
+    conceptCard
+  };
+}
+
+function buildHermesPanel(state: PipelineStateDocument): HermesPanel {
+  const reportBackedPanel = buildHermesPanelFromReports(state);
+  if (reportBackedPanel) {
+    return reportBackedPanel;
+  }
+
+  const hasConcept = Boolean(state.paper_claim_map?.core_contribution);
+  const hasImplementation = Boolean(state.baseline_result?.mode);
+  const hasArtifacts = Boolean(state.experiment_artifacts?.success);
+  const hasImprovements = Boolean(state.path_results?.length);
+  const gate3Passed = Boolean(state.gate_3?.passed);
+
+  return {
+    title: "Hermes Verification",
+    summary:
+      "Hermes checks whether the current story is grounded in source text, implementation evidence, and run artifacts before the UI treats it as trustworthy.",
+    overallStatus: gate3Passed
+      ? "verified"
+      : hasArtifacts
+        ? "caveat"
+        : hasConcept
+          ? "checking"
+          : "pending",
+    checks: [
+      {
+        id: "hermes-concept",
+        label: "Paper concept extracted",
+        detail: hasConcept
+          ? "The paper claim map has been extracted and attached to the run."
+          : "Waiting for paper understanding output.",
+        status: hasConcept ? "verified" : "pending",
+        evidenceLabel: state.paper_claim_map?.datasets?.[0]?.name
+      },
+      {
+        id: "hermes-grounding",
+        label: "Claim grounded in source text",
+        detail: hasConcept
+          ? "The active concept is linked back to the extracted paper contract."
+          : "Source grounding will start after claim extraction.",
+        status: hasConcept ? "verified" : "pending",
+        evidenceLabel: state.paper_claim_map?.metrics?.[0]?.name
+      },
+      {
+        id: "hermes-implementation",
+        label: "Implementation matches concept",
+        detail: hasImplementation
+          ? "Baseline implementation output has been produced from the paper plan."
+          : "Implementation evidence is not available yet.",
+        status: hasImplementation ? "checking" : "pending",
+        evidenceLabel: state.baseline_result?.mode
+      },
+      {
+        id: "hermes-artifacts",
+        label: "Artifacts support reported result",
+        detail: hasArtifacts
+          ? "Hermes can now compare the UI claim against the baseline artifacts."
+          : "No baseline artifact bundle has been verified yet.",
+        status: hasArtifacts ? "caveat" : "pending",
+        evidenceLabel: state.experiment_artifacts?.log_path
+      },
+      {
+        id: "hermes-improvement",
+        label: "Improvement claim verified",
+        detail: hasImprovements
+          ? "Improvement outcomes exist, but Hermes will not mark them verified until the final gate passes."
+          : "Improvement verification unlocks after the baseline passes.",
+        status: gate3Passed ? "verified" : hasImprovements ? "checking" : "pending",
+        evidenceLabel: hasImprovements ? `${state.path_results?.length ?? 0} paths` : undefined
+      }
+    ]
+  };
+}
+
+function buildConceptCard(state: PipelineStateDocument): ConceptCard {
+  const baselineReward = state.experiment_artifacts?.metrics?.mean_reward;
+  const bestImprovement = (state.path_results ?? [])
+    .filter((path) => path.success)
+    .sort(
+      (left, right) =>
+        Number(right.metrics?.improvement ?? -Infinity) -
+        Number(left.metrics?.improvement ?? -Infinity)
+    )[0];
+
+  const hasImplementation = Boolean(state.baseline_result?.mode);
+  const hasArtifacts = Boolean(state.experiment_artifacts?.success);
+  const hasImprovement = Boolean(bestImprovement);
+
+  return {
+    id: "paper-concept-primary",
+    title: state.paper_claim_map?.core_contribution ?? "Paper concept pending",
+    interpretation:
+      "This panel tracks how one paper idea moves from extraction and interpretation into code, evidence, and possible improvement.",
+    status: hasImprovement
+      ? "improved"
+      : hasArtifacts
+        ? "validated"
+        : hasImplementation
+          ? "active"
+          : "planned",
+    implementedSurface: hasImplementation
+      ? `Baseline mode: ${state.baseline_result?.mode}`
+      : "Implementation surface pending",
+    artifactHint: state.experiment_artifacts?.log_path ?? "Waiting for validation artifacts",
+    metricHint:
+      baselineReward !== undefined ? `Baseline reward: ${baselineReward}` : "Metric pending",
+    improvementHint: bestImprovement
+      ? `${bestImprovement.path_id}: ${bestImprovement.metrics?.improvement ?? "n/a"} delta`
+      : undefined,
+    milestones: [
+      {
+        id: "depict-extracted",
+        label: "Extracted",
+        detail: state.paper_claim_map?.core_contribution
+          ? "Concept recovered from the paper understanding stage."
+          : "Paper concept not extracted yet.",
+        status: state.paper_claim_map?.core_contribution ? "done" : "pending"
+      },
+      {
+        id: "depict-interpreted",
+        label: "Interpreted",
+        detail: state.reproduction_contract?.reproduction_definition
+          ? "The concept has been translated into a reproduction contract."
+          : "Interpretation is waiting on the planner.",
+        status: state.reproduction_contract?.reproduction_definition ? "done" : "pending"
+      },
+      {
+        id: "depict-implemented",
+        label: "Implemented",
+        detail: hasImplementation
+          ? "A baseline implementation has been produced from the concept."
+          : "Implementation has not been emitted yet.",
+        status: hasImplementation ? "done" : "active"
+      },
+      {
+        id: "depict-validated",
+        label: "Validated",
+        detail: hasArtifacts
+          ? "Run artifacts now support the implemented concept."
+          : "Validation is waiting on experiment artifacts.",
+        status: hasArtifacts ? "done" : hasImplementation ? "active" : "pending"
+      },
+      {
+        id: "depict-improved",
+        label: "Improved",
+        detail: hasImprovement
+          ? "At least one improvement path has produced a measurable outcome."
+          : "Improvement evidence is not available yet.",
+        status: hasImprovement ? "done" : "pending"
       }
     ]
   };
@@ -372,8 +734,18 @@ export function buildLiveDemoDashboard(
     summary: "Claim map published to shared context for downstream agents."
   });
   events.push({
-    event: "agent_completed",
+    event: "hermes_check_updated",
     timestamp: isoAt(4),
+    panel: buildHermesPanel({
+      ...state,
+      baseline_result: undefined,
+      experiment_artifacts: undefined,
+      path_results: []
+    })
+  });
+  events.push({
+    event: "agent_completed",
+    timestamp: isoAt(5),
     agent: eventAgent(
       "paper-understanding",
       "Paper Understanding",
@@ -387,7 +759,7 @@ export function buildLiveDemoDashboard(
 
   events.push({
     event: "agent_started",
-    timestamp: isoAt(5),
+    timestamp: isoAt(6),
     agent: eventAgent(
       "environment-detective",
       "Environment Detective",
@@ -400,7 +772,7 @@ export function buildLiveDemoDashboard(
   });
   events.push({
     event: "agent_reasoning_step",
-    timestamp: isoAt(6),
+    timestamp: isoAt(7),
     agentId: "environment-detective",
     agentLabel: "Environment Detective",
     stepType: "analysis",
@@ -416,7 +788,7 @@ export function buildLiveDemoDashboard(
   });
   events.push({
     event: "shared_state_updated",
-    timestamp: isoAt(7),
+    timestamp: isoAt(8),
     agentId: "environment-detective",
     changeType: "message",
     title: "Environment spec returned to orchestration",
@@ -426,14 +798,14 @@ export function buildLiveDemoDashboard(
   });
   events.push({
     event: "context_enrichment",
-    timestamp: isoAt(8),
+    timestamp: isoAt(9),
     agentId: "environment-detective",
     variableName: "environment_spec",
     summary: "Dockerfile and package versions added to shared context."
   });
   events.push({
     event: "agent_completed",
-    timestamp: isoAt(9),
+    timestamp: isoAt(10),
     agent: eventAgent(
       "environment-detective",
       "Environment Detective",
@@ -447,7 +819,7 @@ export function buildLiveDemoDashboard(
 
   events.push({
     event: "verification_gate_result",
-    timestamp: isoAt(10),
+    timestamp: isoAt(11),
     stage: "plan",
     status: toStatusTone(state.gate_1?.status),
     detail: state.gate_1?.passed
@@ -457,7 +829,7 @@ export function buildLiveDemoDashboard(
 
   events.push({
     event: "agent_started",
-    timestamp: isoAt(11),
+    timestamp: isoAt(12),
     agent: eventAgent(
       "baseline-implementation",
       "Baseline Implementation",
@@ -470,7 +842,7 @@ export function buildLiveDemoDashboard(
   });
   events.push({
     event: "agent_reasoning_step",
-    timestamp: isoAt(12),
+    timestamp: isoAt(13),
     agentId: "baseline-implementation",
     agentLabel: "Baseline Implementation",
     stepType: "analysis",
@@ -485,8 +857,17 @@ export function buildLiveDemoDashboard(
     }))
   });
   events.push({
+    event: "concept_card_updated",
+    timestamp: isoAt(14),
+    card: buildConceptCard({
+      ...state,
+      experiment_artifacts: undefined,
+      path_results: []
+    })
+  });
+  events.push({
     event: "agent_completed",
-    timestamp: isoAt(13),
+    timestamp: isoAt(15),
     agent: eventAgent(
       "baseline-implementation",
       "Baseline Implementation",
@@ -500,7 +881,7 @@ export function buildLiveDemoDashboard(
 
   events.push({
     event: "agent_started",
-    timestamp: isoAt(14),
+    timestamp: isoAt(16),
     agent: eventAgent(
       "experiment-runner",
       "Experiment Runner",
@@ -513,7 +894,7 @@ export function buildLiveDemoDashboard(
   });
   events.push({
     event: "agent_reasoning_step",
-    timestamp: isoAt(15),
+    timestamp: isoAt(17),
     agentId: "experiment-runner",
     agentLabel: "Experiment Runner",
     stepType: "analysis",
@@ -533,14 +914,30 @@ export function buildLiveDemoDashboard(
   });
   events.push({
     event: "context_enrichment",
-    timestamp: isoAt(16),
+    timestamp: isoAt(18),
     agentId: "experiment-runner",
     variableName: "baseline_artifacts",
     summary: "Run logs, metrics, provenance, and plots were attached to the shared context."
   });
   events.push({
+    event: "hermes_check_updated",
+    timestamp: isoAt(19),
+    panel: buildHermesPanel({
+      ...state,
+      path_results: []
+    })
+  });
+  events.push({
+    event: "concept_card_updated",
+    timestamp: isoAt(20),
+    card: buildConceptCard({
+      ...state,
+      path_results: []
+    })
+  });
+  events.push({
     event: "agent_completed",
-    timestamp: isoAt(17),
+    timestamp: isoAt(21),
     agent: eventAgent(
       "experiment-runner",
       "Experiment Runner",
@@ -554,7 +951,7 @@ export function buildLiveDemoDashboard(
 
   events.push({
     event: "verification_gate_result",
-    timestamp: isoAt(18),
+    timestamp: isoAt(22),
     stage: "baseline",
     status: toStatusTone(state.gate_2?.status),
     detail: state.gate_2?.passed
@@ -564,7 +961,7 @@ export function buildLiveDemoDashboard(
 
   events.push({
     event: "agent_started",
-    timestamp: isoAt(19),
+    timestamp: isoAt(23),
     agent: eventAgent(
       "improvement-orchestrator",
       "Improvement Orchestrator",
@@ -634,7 +1031,7 @@ export function buildLiveDemoDashboard(
 
   events.push({
     event: "agent_completed",
-    timestamp: isoAt(20 + pathResults.length * 3),
+    timestamp: isoAt(24 + pathResults.length * 3),
     agent: eventAgent(
       "improvement-orchestrator",
       "Improvement Orchestrator",
@@ -648,7 +1045,7 @@ export function buildLiveDemoDashboard(
 
   events.push({
     event: "verification_gate_result",
-    timestamp: isoAt(21 + pathResults.length * 3),
+    timestamp: isoAt(25 + pathResults.length * 3),
     stage: "improvement",
     status: toStatusTone(state.gate_3?.status),
     detail: state.gate_3?.passed
@@ -657,8 +1054,18 @@ export function buildLiveDemoDashboard(
   });
 
   events.push({
+    event: "hermes_check_updated",
+    timestamp: isoAt(26 + pathResults.length * 3),
+    panel: buildHermesPanel(state)
+  });
+  events.push({
+    event: "concept_card_updated",
+    timestamp: isoAt(27 + pathResults.length * 3),
+    card: buildConceptCard(state)
+  });
+  events.push({
     event: "context_enrichment",
-    timestamp: isoAt(22 + pathResults.length * 3),
+    timestamp: isoAt(28 + pathResults.length * 3),
     agentId: "root-orchestrator",
     variableName: "research_map",
     summary: "Promising directions, dead ends, and next experiments were synthesized."
@@ -666,7 +1073,7 @@ export function buildLiveDemoDashboard(
 
   events.push({
     event: "agent_completed",
-    timestamp: isoAt(23 + pathResults.length * 3),
+    timestamp: isoAt(29 + pathResults.length * 3),
     agent: buildRootAgent(meta, state)
   });
 

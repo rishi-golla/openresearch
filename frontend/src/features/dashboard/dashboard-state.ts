@@ -204,6 +204,16 @@ export function applyDashboardEvent(
       };
     case "context_enrichment":
       return applyContextEnrichment(snapshot, event);
+    case "hermes_check_updated":
+      return {
+        ...snapshot,
+        hermesPanel: event.panel
+      };
+    case "concept_card_updated":
+      return {
+        ...snapshot,
+        conceptCard: event.card
+      };
     default:
       return snapshot;
   }

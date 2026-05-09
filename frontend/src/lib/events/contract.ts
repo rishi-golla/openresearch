@@ -21,6 +21,13 @@ export type PipelineStage = "plan" | "baseline" | "improvement";
 export type ProgressStatus = "pending" | "running" | "passed" | "failed" | "caveat";
 
 export type ApprovalStatus = "pending" | "approved" | "rejected";
+export type HermesCheckStatus =
+  | "pending"
+  | "checking"
+  | "verified"
+  | "caveat"
+  | "unsupported";
+export type ConceptMilestoneStatus = "pending" | "active" | "done";
 
 export interface Citation {
   id: string;
@@ -84,6 +91,40 @@ export interface DataPanel {
   items: string[];
 }
 
+export interface HermesCheckItem {
+  id: string;
+  label: string;
+  detail: string;
+  status: HermesCheckStatus;
+  evidenceLabel?: string;
+}
+
+export interface HermesPanel {
+  title: string;
+  summary: string;
+  overallStatus: HermesCheckStatus;
+  checks: HermesCheckItem[];
+}
+
+export interface ConceptMilestone {
+  id: string;
+  label: string;
+  detail: string;
+  status: ConceptMilestoneStatus;
+}
+
+export interface ConceptCard {
+  id: string;
+  title: string;
+  interpretation: string;
+  status: "planned" | "active" | "validated" | "improved";
+  implementedSurface: string;
+  artifactHint: string;
+  metricHint: string;
+  improvementHint?: string;
+  milestones: ConceptMilestone[];
+}
+
 export interface DashboardSnapshot {
   agents: AgentNode[];
   reasoning: ReasoningEntry[];
@@ -92,6 +133,8 @@ export interface DashboardSnapshot {
   approvals: ApprovalEntry[];
   progress: ProgressEntry[];
   dataPanels: DataPanel[];
+  hermesPanel: HermesPanel | null;
+  conceptCard: ConceptCard | null;
 }
 
 interface BaseDashboardEvent {
@@ -160,6 +203,16 @@ export interface ContextEnrichmentEvent extends BaseDashboardEvent {
   summary: string;
 }
 
+export interface HermesCheckUpdatedEvent extends BaseDashboardEvent {
+  event: "hermes_check_updated";
+  panel: HermesPanel;
+}
+
+export interface ConceptCardUpdatedEvent extends BaseDashboardEvent {
+  event: "concept_card_updated";
+  card: ConceptCard;
+}
+
 export type DashboardEvent =
   | AgentLifecycleEvent
   | AgentReasoningStepEvent
@@ -168,7 +221,9 @@ export type DashboardEvent =
   | VerificationGateResultEvent
   | ApprovalRequestedEvent
   | ApprovalResolvedEvent
-  | ContextEnrichmentEvent;
+  | ContextEnrichmentEvent
+  | HermesCheckUpdatedEvent
+  | ConceptCardUpdatedEvent;
 
 export type DashboardEventListener = (event: DashboardEvent) => void;
 

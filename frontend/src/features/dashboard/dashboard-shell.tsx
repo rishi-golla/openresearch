@@ -3,8 +3,12 @@
 import type {
   AgentNode,
   ApprovalStatus,
+  ConceptCard,
+  ConceptMilestoneStatus,
   DashboardEventAdapter,
   DataPanel,
+  HermesCheckStatus,
+  HermesPanel,
   MessageEntry,
   ProgressEntry,
   ReasoningEntry
@@ -32,6 +36,31 @@ function statusTone(
       return "status-negative";
     case "caveat":
     case "waiting":
+      return "status-caution";
+    default:
+      return "status-neutral";
+  }
+}
+
+function hermesTone(status: HermesCheckStatus): string {
+  switch (status) {
+    case "verified":
+      return "status-positive";
+    case "caveat":
+    case "checking":
+      return "status-caution";
+    case "unsupported":
+      return "status-negative";
+    default:
+      return "status-neutral";
+  }
+}
+
+function conceptTone(status: ConceptMilestoneStatus): string {
+  switch (status) {
+    case "done":
+      return "status-positive";
+    case "active":
       return "status-caution";
     default:
       return "status-neutral";
@@ -130,6 +159,83 @@ function PanelCard({ panel }: { panel: DataPanel }) {
   );
 }
 
+function HermesVerificationPanel({ panel }: { panel: HermesPanel }) {
+  return (
+    <section className="panel hermes-panel">
+      <div className="panel-header">
+        <div>
+          <p className="eyebrow">Verification surface</p>
+          <h2>{panel.title}</h2>
+        </div>
+        <span className={`status-pill ${hermesTone(panel.overallStatus)}`}>
+          {panel.overallStatus}
+        </span>
+      </div>
+      <p className="card-copy">{panel.summary}</p>
+      <div className="hermes-checklist">
+        {panel.checks.map((check) => (
+          <article className="hermes-check-item" key={check.id}>
+            <div>
+              <h3>{check.label}</h3>
+              <p>{check.detail}</p>
+              {check.evidenceLabel ? (
+                <span className="hermes-evidence">{check.evidenceLabel}</span>
+              ) : null}
+            </div>
+            <span className={`status-pill ${hermesTone(check.status)}`}>{check.status}</span>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function PaperDepictionPanel({ card }: { card: ConceptCard }) {
+  return (
+    <section className="panel depiction-panel">
+      <div className="panel-header">
+        <div>
+          <p className="eyebrow">Paper depiction</p>
+          <h2>{card.title}</h2>
+        </div>
+        <span className="status-pill status-neutral">{card.status}</span>
+      </div>
+      <p className="card-copy">{card.interpretation}</p>
+      <div className="depiction-milestones">
+        {card.milestones.map((milestone) => (
+          <article className="depiction-milestone" key={milestone.id}>
+            <div className={`depiction-dot ${conceptTone(milestone.status)}`} />
+            <div>
+              <h3>{milestone.label}</h3>
+              <p>{milestone.detail}</p>
+            </div>
+          </article>
+        ))}
+      </div>
+      <div className="depiction-evidence-grid">
+        <article className="panel-card">
+          <p className="eyebrow">Implemented surface</p>
+          <h3>{card.implementedSurface}</h3>
+        </article>
+        <article className="panel-card">
+          <p className="eyebrow">Validation artifact</p>
+          <h3>{card.artifactHint}</h3>
+        </article>
+        <article className="panel-card">
+          <p className="eyebrow">Metric</p>
+          <h3>{card.metricHint}</h3>
+        </article>
+        {card.improvementHint ? (
+          <article className="panel-card">
+            <p className="eyebrow">Improvement</p>
+            <h3>{card.improvementHint}</h3>
+          </article>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 export function DashboardShell({ adapter }: DashboardShellProps) {
   const snapshot = useDashboardState(adapter ?? defaultAdapter);
 
@@ -158,6 +264,11 @@ export function DashboardShell({ adapter }: DashboardShellProps) {
             <span className="stat-label">approvals visible</span>
           </div>
         </div>
+      </section>
+
+      <section className="dashboard-highlights">
+        {snapshot.hermesPanel ? <HermesVerificationPanel panel={snapshot.hermesPanel} /> : null}
+        {snapshot.conceptCard ? <PaperDepictionPanel card={snapshot.conceptCard} /> : null}
       </section>
 
       <section className="dashboard-grid">

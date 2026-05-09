@@ -2,7 +2,9 @@ import type {
   AgentNode,
   ApprovalEntry,
   DashboardEvent,
-  DashboardSnapshot
+  DashboardSnapshot,
+  HermesPanel,
+  ConceptCard
 } from "./contract";
 
 const agents: AgentNode[] = [
@@ -58,6 +60,81 @@ const pendingApproval: ApprovalEntry = {
   detail: "Original benchmark mirror timed out. Approve fallback download?",
   status: "pending",
   timestamp: "2026-05-08T22:15:30Z"
+};
+
+const initialHermesPanel: HermesPanel = {
+  title: "Hermes Verification",
+  summary: "Hermes is checking whether the current narrative is grounded before it is treated as trustworthy.",
+  overallStatus: "checking",
+  checks: [
+    {
+      id: "hermes-claim",
+      label: "Claim grounded in paper",
+      detail: "The extracted concept is linked to a primary source section.",
+      status: "verified",
+      evidenceLabel: "Paper section 3.2"
+    },
+    {
+      id: "hermes-impl",
+      label: "Implementation matches concept",
+      detail: "Waiting for implementation evidence from the builder agents.",
+      status: "checking"
+    },
+    {
+      id: "hermes-artifacts",
+      label: "Artifacts support result",
+      detail: "No baseline artifacts available yet.",
+      status: "pending"
+    },
+    {
+      id: "hermes-publish",
+      label: "UI claim safe to publish",
+      detail: "Hermes will only mark the story publishable after evidence is complete.",
+      status: "caveat"
+    }
+  ]
+};
+
+const initialConceptCard: ConceptCard = {
+  id: "concept-mixmatch-core",
+  title: "Consistency Regularization",
+  interpretation: "The pipeline is translating the paper's semi-supervised consistency idea into a runnable training flow.",
+  status: "active",
+  implementedSurface: "Pending implementation surface",
+  artifactHint: "Validation artifact will attach after the first baseline run.",
+  metricHint: "Baseline metric: top-1 accuracy",
+  milestones: [
+    {
+      id: "concept-extracted",
+      label: "Extracted",
+      detail: "Core concept recovered from the paper text.",
+      status: "done"
+    },
+    {
+      id: "concept-interpreted",
+      label: "Interpreted",
+      detail: "Mapped into an executable training concept.",
+      status: "done"
+    },
+    {
+      id: "concept-implemented",
+      label: "Implemented",
+      detail: "Implementation target not published yet.",
+      status: "active"
+    },
+    {
+      id: "concept-validated",
+      label: "Validated",
+      detail: "Validation waits on baseline artifacts.",
+      status: "pending"
+    },
+    {
+      id: "concept-improved",
+      label: "Improved",
+      detail: "Improvement analysis unlocks after verification.",
+      status: "pending"
+    }
+  ]
 };
 
 export const initialDashboardSnapshot: DashboardSnapshot = {
@@ -148,7 +225,9 @@ export const initialDashboardSnapshot: DashboardSnapshot = {
         "Metrics and plots panels will populate after the first baseline run."
       ]
     }
-  ]
+  ],
+  hermesPanel: initialHermesPanel,
+  conceptCard: initialConceptCard
 };
 
 export const mockDashboardEvents: DashboardEvent[] = [
@@ -220,6 +299,47 @@ export const mockDashboardEvents: DashboardEvent[] = [
     stage: "baseline",
     status: "caveat",
     detail: "Baseline can proceed, but dataset fallback requires approval."
+  },
+  {
+    event: "hermes_check_updated",
+    timestamp: "2026-05-08T22:15:24Z",
+    panel: {
+      ...initialHermesPanel,
+      overallStatus: "caveat",
+      checks: initialHermesPanel.checks.map((check) =>
+        check.id === "hermes-impl"
+          ? {
+              ...check,
+              status: "caveat",
+              detail: "Implementation target exists, but the artifact proof is still incomplete.",
+              evidenceLabel: "Environment candidate v1"
+            }
+          : check
+      )
+    }
+  },
+  {
+    event: "concept_card_updated",
+    timestamp: "2026-05-08T22:15:26Z",
+    card: {
+      ...initialConceptCard,
+      implementedSurface: "trainer.py -> consistency loss branch",
+      milestones: initialConceptCard.milestones.map((milestone) =>
+        milestone.id === "concept-implemented"
+          ? {
+              ...milestone,
+              detail: "Trainer implementation target has been identified.",
+              status: "done"
+            }
+          : milestone.id === "concept-validated"
+            ? {
+                ...milestone,
+                detail: "Validation is now waiting on run artifacts.",
+                status: "active"
+              }
+            : milestone
+      )
+    }
   },
   {
     event: "approval_requested",

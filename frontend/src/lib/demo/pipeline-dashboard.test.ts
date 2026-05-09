@@ -129,6 +129,8 @@ describe("buildLiveDemoDashboard", () => {
     expect(data.summary.sourceLabel).toBe("In-repo PPO workspace fixture");
     expect(data.runMode).toBe("sdk");
     expect(data.summary.runModeLabel).toBe("SDK");
+    expect(data.initialSnapshot.hermesPanel?.title).toBe("Hermes Verification");
+    expect(data.initialSnapshot.conceptCard?.title).toContain("Proximal Policy Optimization");
   });
 
   it("marks unfinished stages as pending for in-flight runs", () => {
@@ -185,5 +187,97 @@ describe("buildLiveDemoDashboard", () => {
 
     expect(data.summary.runModeLabel).toBe("SDK: OpenAI");
     expect(data.summary.llmProvider).toBe("openai");
+  });
+
+  it("prefers real backend Hermes audit reports when available", () => {
+    const data = buildLiveDemoDashboard(
+      {
+        project_id: "ui_sdk_demo_789",
+        stage: "complete",
+        paper_claim_map: {
+          core_contribution: "Trust-region style PPO variant"
+        },
+        hermes_step_reports: {
+          "paper-understanding": [
+            {
+              target: "paper-understanding",
+              scope: "step",
+              status: "grounded",
+              summary: "Paper concept is grounded in the extracted claim map.",
+              evidence_refs: [{ path: "runs/ui_sdk_demo_789/paper_claim_map.json" }]
+            }
+          ],
+          "baseline-implementation": [
+            {
+              target: "baseline-implementation",
+              scope: "step",
+              status: "caveat",
+              summary: "Implementation mostly matches the concept but one assumption stayed implicit.",
+              recommended_intervention: "request_evidence"
+            }
+          ]
+        },
+        hermes_checkpoint_reports: {
+          gate_2: [
+            {
+              target: "gate_2",
+              scope: "checkpoint",
+              status: "unsupported",
+              summary: "One reported baseline claim is not backed by artifact evidence.",
+              unsupported_claims: ["Baseline summary overstates the validated reward delta."],
+              recommended_intervention: "downgrade_claim",
+              evidence_refs: [{ path: "runs/ui_sdk_demo_789/baseline/metrics.json" }]
+            }
+          ]
+        },
+        hermes_interventions: [
+          {
+            target: "gate_2",
+            scope: "checkpoint",
+            action: "downgrade_claim",
+            reason: "Unsupported baseline summary",
+            status: "unsupported"
+          }
+        ]
+      },
+      {
+        projectId: "ui_sdk_demo_789",
+        outputDir: "runs/ui_sdk_demo_789",
+        sourceKind: "workspace_fixture",
+        runMode: "sdk",
+        sourceLabel: "In-repo PPO workspace fixture",
+        sourceNote: "Fixture"
+      }
+    );
+
+    expect(data.initialSnapshot.hermesPanel?.overallStatus).toBe("unsupported");
+    expect(data.initialSnapshot.hermesPanel?.summary).toContain("1 intervention");
+    expect(data.initialSnapshot.hermesPanel?.checks[0]?.detail).toContain("grounded");
+    expect(data.initialSnapshot.hermesPanel?.checks[3]?.detail).toContain(
+      "not backed by artifact evidence"
+    );
+  });
+
+  it("surfaces uploaded-paper metadata in the source summary", () => {
+    const data = buildLiveDemoDashboard(
+      {
+        project_id: "prj_upload",
+        stage: "complete",
+        paper_claim_map: {
+          core_contribution: "Uploaded PPO paper"
+        }
+      },
+      {
+        projectId: "prj_upload",
+        outputDir: "runs/prj_upload",
+        sourceKind: "uploaded_pdf",
+        runMode: "offline",
+        sourceLabel: "ppo-paper.pdf",
+        sourceNote: "Uploaded from the lab page."
+      }
+    );
+
+    expect(data.summary.sourceLabel).toBe("ppo-paper.pdf");
+    expect(data.initialSnapshot.dataPanels[1]?.items).toContain("Uploaded from the lab page.");
   });
 });
