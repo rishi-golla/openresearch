@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import HomePage from "../app/page";
 
@@ -46,5 +46,28 @@ describe("landing page", () => {
     for (const label of ["INTERSCOPE", "SPOTIFY", "Nexera", "M3", "LAURA COLE", "vertex"]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
+  });
+
+  it("switches overlay content when a tab is clicked", () => {
+    render(<HomePage />);
+
+    fireEvent.click(screen.getAllByRole("button", { name: /deploy/i })[0]);
+
+    expect(screen.getByText(/deploy to production/i)).toBeInTheDocument();
+  });
+
+  it("auto-cycles overlays every 4 seconds", () => {
+    vi.useFakeTimers();
+
+    render(<HomePage />);
+    expect(screen.getByText(/set up your ai workspace/i)).toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(4000);
+    });
+
+    expect(screen.getByText(/ai model training/i)).toBeInTheDocument();
+
+    vi.useRealTimers();
   });
 });
