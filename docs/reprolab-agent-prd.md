@@ -2502,7 +2502,7 @@ Resolved questions are marked with their decision.
 20. What resource limits should local Docker sandboxes enforce by default? (Suggested: 4 CPU, 8 GB RAM, 20 GB disk, 30-minute wall-clock timeout.)
 21. Should the Knowledge Graph (Graphify) be MVP or Phase 2? (Decision: Phase 2 — demo papers have small repos; Graphify pays off with larger codebases.)
 22. At what scale of improvement agents should the system switch from orchestrator-mediated to blackboard-based coordination? (Suggested: blackboard for N > 5 concurrent improvement agents.)
-23. Should progressive context enrichment be eager (add all agent outputs to REPL immediately) or lazy (add only when a downstream agent requests it)?
+23. ~~Should progressive context enrichment be eager (add all agent outputs to REPL immediately) or lazy (add only when a downstream agent requests it)?~~ **Resolved: Eager. All agent outputs are immediately added as REPL variables when the agent completes. Simpler, and data is small enough for MVP. Lazy loading can be revisited at production scale.**
 
 ## Recommended MVP Positioning
 
