@@ -31,9 +31,9 @@ def test_execution_profile_max_raises_bounded_budgets() -> None:
     assert profile.sandbox_platform == "linux/amd64"
 
 
-def test_sandbox_mode_auto_keeps_docker_for_sdk_and_simulation_for_offline() -> None:
+def test_sandbox_mode_auto_defaults_to_docker_for_all_user_modes() -> None:
     assert resolve_sandbox_mode("auto", pipeline_mode="sdk") is SandboxMode.docker
-    assert resolve_sandbox_mode("auto", pipeline_mode="offline") is SandboxMode.simulate
+    assert resolve_sandbox_mode("auto", pipeline_mode="offline") is SandboxMode.docker
 
 
 def test_sandbox_mode_preserves_explicit_simulation_request() -> None:

@@ -13,6 +13,37 @@ describe("LiveDemoClient", () => {
     vi.unstubAllGlobals();
   });
 
+  it("uses the automatic Docker-first sandbox by default", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        projectId: "ui_sdk_demo_1",
+        outputDir: "runs/ui_sdk_demo_1",
+        runMode: "sdk",
+        llmProvider: "anthropic",
+        executionMode: "efficient",
+        sandboxMode: "auto",
+        status: "queued",
+        payload: null,
+        log: ""
+      })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<LiveDemoClient initialRun={null} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /run sdk/i }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/demo?mode=sdk&provider=anthropic&executionMode=efficient&sandbox=auto",
+        {
+          method: "POST"
+        }
+      );
+    });
+  });
+
   it("passes the selected SDK provider when starting an SDK run", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

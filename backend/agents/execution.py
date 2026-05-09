@@ -98,13 +98,15 @@ def resolve_sandbox_mode(
     *,
     pipeline_mode: str,
 ) -> SandboxMode:
-    """Resolve auto sandbox policy from the high-level pipeline mode."""
+    """Resolve auto sandbox policy from the high-level pipeline mode.
+
+    Auto is intentionally Docker-first for user-triggered runs. Local host
+    execution is never selected implicitly; callers must request it explicitly.
+    """
 
     mode = SandboxMode(requested)
     if mode is not SandboxMode.auto:
         return mode
-    if pipeline_mode == "offline":
-        return SandboxMode.simulate
     return SandboxMode.docker
 
 

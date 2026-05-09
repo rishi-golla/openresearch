@@ -47,14 +47,19 @@ const EXECUTION_OPTIONS: Array<{
 ];
 const SANDBOX_OPTIONS: Array<{ value: DemoSandboxMode; label: string; helper: string }> = [
   {
-    value: "local",
-    label: "Local",
-    helper: "Fast iteration"
+    value: "auto",
+    label: "Auto Docker",
+    helper: "Docker first"
   },
   {
     value: "docker",
     label: "Docker",
     helper: "Container sandbox"
+  },
+  {
+    value: "local",
+    label: "Local",
+    helper: "Explicit host run"
   }
 ];
 
@@ -144,7 +149,7 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
     initialRun?.executionMode ?? "efficient"
   );
   const [sandboxMode, setSandboxMode] = useState<DemoSandboxMode>(
-    initialRun?.sandboxMode ?? "local"
+    initialRun?.sandboxMode ?? "auto"
   );
   const [selectedPaper, setSelectedPaper] = useState<File | null>(null);
   const [runningMode, setRunningMode] = useState<"offline" | "sdk" | null>(
@@ -325,7 +330,8 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
     EXECUTION_OPTIONS.find((option) => option.value === activeExecutionMode)?.label ??
     "Efficient";
   const activeSandboxLabel =
-    SANDBOX_OPTIONS.find((option) => option.value === activeSandboxMode)?.label ?? "Local";
+    SANDBOX_OPTIONS.find((option) => option.value === activeSandboxMode)?.label ??
+    "Auto Docker";
 
   return (
     <main className="min-h-screen bg-stone-950 px-6 py-10 text-stone-100">

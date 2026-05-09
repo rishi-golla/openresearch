@@ -6,7 +6,7 @@ export type DemoProvider = "anthropic" | "openai";
 
 export type DemoExecutionMode = "efficient" | "max";
 
-export type DemoSandboxMode = "local" | "docker";
+export type DemoSandboxMode = "auto" | "docker" | "local";
 
 export type DemoRunStatus =
   | "queued"

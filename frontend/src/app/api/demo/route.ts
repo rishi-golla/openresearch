@@ -45,7 +45,7 @@ function toExecutionMode(request: Request): DemoExecutionMode | undefined {
 function toSandboxMode(request: Request): DemoSandboxMode | undefined {
   const url = new URL(request.url);
   const value = url.searchParams.get("sandbox");
-  if (value === "local" || value === "docker") {
+  if (value === "auto" || value === "docker" || value === "local") {
     return value;
   }
   return undefined;
@@ -82,9 +82,9 @@ export async function POST(request: Request) {
           ? executionMode
           : toExecutionMode(request) ?? "efficient";
       const runSandboxMode =
-        sandboxMode === "local" || sandboxMode === "docker"
+        sandboxMode === "auto" || sandboxMode === "docker" || sandboxMode === "local"
           ? sandboxMode
-          : toSandboxMode(request) ?? "local";
+          : toSandboxMode(request) ?? "auto";
 
       if (!(paper instanceof File) || paper.size === 0) {
         return NextResponse.json(
@@ -122,7 +122,7 @@ export async function POST(request: Request) {
       toRunMode(request) ?? "offline",
       toProvider(request) ?? "anthropic",
       toExecutionMode(request) ?? "efficient",
-      toSandboxMode(request) ?? "local"
+      toSandboxMode(request) ?? "auto"
     );
     return NextResponse.json(run, { status: 202 });
   } catch (error) {

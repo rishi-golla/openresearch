@@ -25,7 +25,7 @@ from backend.agents.schemas import (
     ResearchMap,
 )
 from backend.agents.orchestrator import PipelineStage, PipelineState
-from backend.agents.execution import ExecutionProfile, SandboxMode
+from backend.agents.execution import ExecutionProfile, SandboxMode, resolve_sandbox_mode
 from backend.agents.runtime import AgentRuntime, ProviderName
 
 logger = logging.getLogger(__name__)
@@ -100,7 +100,7 @@ def run_pipeline_offline(
 
     runs = Path(runs_root)
     profile = execution_profile or ExecutionProfile.from_mode("efficient")
-    resolved_sandbox_mode = SandboxMode(sandbox_mode)
+    resolved_sandbox_mode = resolve_sandbox_mode(sandbox_mode, pipeline_mode="offline")
     state = PipelineState(project_id=project_id)
 
     # --- Step 1: Paper Understanding ---

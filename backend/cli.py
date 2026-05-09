@@ -491,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
         default="auto",
         help=(
             "Experiment backend: local runs commands on the host; docker is isolated; "
-            "auto uses Docker for SDK mode and deterministic simulation for offline mode."
+            "auto selects Docker and never falls back to host-local execution."
         ),
     )
     reproduce.add_argument(

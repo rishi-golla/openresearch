@@ -187,7 +187,13 @@ function runModeLabel(runMode: LiveDemoMeta["runMode"], provider?: DemoProvider)
 }
 
 function sandboxLabel(mode?: DemoSandboxMode): string {
-  return mode === "docker" ? "Docker sandbox" : "Local";
+  if (mode === "local") {
+    return "Local";
+  }
+  if (mode === "docker") {
+    return "Docker sandbox";
+  }
+  return "Auto Docker sandbox";
 }
 
 function toStatusTone(status?: GateStatus): ProgressStatus {

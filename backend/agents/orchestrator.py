@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.agents.registry import AGENT_REGISTRY
-from backend.agents.execution import ExecutionProfile, SandboxMode
+from backend.agents.execution import ExecutionProfile, SandboxMode, resolve_sandbox_mode
 from backend.agents.runtime import (
     AgentRuntime,
     AgentRuntimeSpec,
@@ -260,9 +260,12 @@ class ReproLabOrchestrator:
         )
         self.heavy_agent_max_turns = self.execution_profile.heavy_agent_max_turns
         self.permission_mode = permission_mode
-        self.sandbox_mode = SandboxMode(sandbox_mode)
+        self.sandbox_mode = resolve_sandbox_mode(sandbox_mode, pipeline_mode="sdk")
         if self.sandbox_mode is SandboxMode.simulate:
-            self.sandbox_mode = SandboxMode.local
+            raise ValueError(
+                "SDK pipeline does not support simulated experiment execution. "
+                "Use the offline pipeline for deterministic simulation or select docker/local."
+            )
         self._runtime = runtime or make_runtime(provider)
         self._project_dir = self.runs_root / project_id
         self._project_dir.mkdir(parents=True, exist_ok=True)

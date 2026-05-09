@@ -142,7 +142,7 @@ function buildFixtureMeta(
   runMode: DemoRunMode,
   llmProvider?: DemoProvider,
   executionMode: DemoExecutionMode = "efficient",
-  sandboxMode: DemoSandboxMode = "local"
+  sandboxMode: DemoSandboxMode = "auto"
 ): LiveDemoMeta {
   return {
     projectId,
@@ -227,7 +227,7 @@ function metaFromStatus(
   >
 ): LiveDemoMeta {
   const executionMode = status?.executionMode ?? "efficient";
-  const sandboxMode = status?.sandboxMode ?? "local";
+  const sandboxMode = status?.sandboxMode ?? "auto";
 
   if (
     status?.sourceKind === "uploaded_pdf" &&
@@ -508,7 +508,7 @@ async function inferState(projectId: string): Promise<LiveDemoRunState | null> {
     status?.runMode ?? (projectId.startsWith("ui_sdk_") ? "sdk" : "offline");
   const llmProvider = status?.llmProvider ?? providerFromProjectId(projectId);
   const executionMode = status?.executionMode ?? "efficient";
-  const sandboxMode = status?.sandboxMode ?? "local";
+  const sandboxMode = status?.sandboxMode ?? "auto";
   const log = await readLogTail(projectId);
   const payload = await payloadForProject(projectId, runMode, log, status ?? undefined);
 
@@ -619,7 +619,7 @@ export async function startDemoRun(
   runMode: DemoRunMode,
   llmProvider: DemoProvider = "anthropic",
   executionMode: DemoExecutionMode = "efficient",
-  sandboxMode: DemoSandboxMode = "local",
+  sandboxMode: DemoSandboxMode = "auto",
   options?: DemoRunStartOptions
 ): Promise<LiveDemoRunState> {
   const existing = await currentRunningRun(
