@@ -991,21 +991,50 @@ The blackboard pattern eliminates the bottleneck of a single orchestrator needin
 
 The system should not dump the full paper, repo, and logs into every agent. That will be expensive, noisy, and unreliable.
 
-Instead, the system uses a **three-layer context exploration strategy**, with each layer handling a different type of query:
+Instead, the system uses a **unified Context REPL workspace** that gives every agent access to three exploration capabilities simultaneously — not as sequential fallback layers, but as tools the agent combines fluidly based on what the question demands.
 
-**Layer 1 — RLM Context REPL (primary).** Based on [arXiv:2512.24601](https://arxiv.org/abs/2512.24601) (Zhang, Kraska & Khattab, MIT CSAIL), the RLM paradigm treats long context as an external environment: context is stored as Python variables in a REPL, and agents programmatically examine, decompose, and recursively sub-query themselves over snippets of the context. This uses ~2-3k tokens per query instead of stuffing 95k+ tokens into prompts. RLM is best when the agent knows roughly where to look — parsing configs, grepping for version numbers, drilling into a specific paper section.
+The REPL is the single workspace. Inside it, agents have:
 
-**Layer 2 — Semantic Index (fallback and discovery).** A lightweight vector store (Chroma) indexes the same artifacts as chunked embeddings. This layer handles what RLM cannot: fuzzy conceptual similarity ("what other approaches solve this problem similarly?"), surfacing relevant content the agent didn't know to look for, and cross-document discovery where keyword search would miss semantic connections. Agents fall back to semantic search when RLM exploration doesn't yield enough evidence.
+- **Raw variables** — all project artifacts loaded as Python variables. Agents write code to grep, filter, partition, and inspect directly. Based on [RLM (arXiv:2512.24601)](https://arxiv.org/abs/2512.24601) by Zhang, Kraska & Khattab. ~2-3k tokens per recursive query.
+- **`semantic_search()`** — a function available in the REPL that queries the Chroma vector store for fuzzy conceptual similarity and cross-document discovery. Handles what programmatic search cannot: "what other approaches solve this problem similarly?"
+- **`graph_query()`** — a function available in the REPL that queries the knowledge graph for structural relationships. Handles code architecture navigation: "what functions call `train()`?", "what configs set hyperparameters?" MVP uses relational tables; Phase 2 uses [Graphify](https://github.com/safishamsi/graphify) for automated graph construction.
+- **`rlm_query()`** — a function that launches a recursive LLM sub-call over a specific context segment. Used to drill into results from any of the above.
 
-**Layer 3 — Knowledge Graph (structural navigation, Phase 2).** [Graphify](https://github.com/safishamsi/graphify) builds a structural knowledge graph from code and documents using Tree-sitter AST extraction and LLM-driven semantic extraction. This layer handles structural queries that neither RLM nor embeddings are well-suited for: "What functions call the training loop?", "What modules import this class?", "What paper concepts cluster together?" MVP uses relational tables; Phase 2 introduces Graphify for automated graph construction.
+**There is no fallback sequence.** Agents combine all four tools in whatever order the question demands:
 
-**Layered workflow:** Agents use RLM first for precise programmatic exploration. If insufficient, they query the Semantic Index for fuzzy discovery. They use the Knowledge Graph for structural navigation of code and concept relationships. Results from any layer can feed into RLM for recursive drill-down.
+```python
+# One agent, one REPL session — all tools used together
 
-### Recursive Context Exploration (RLM)
+# Graph: find structural relationships in the codebase
+training_funcs = graph_query("function", calls="train")
+config_files = graph_query("config_file", sets="hyperparameter")
+
+# Raw variables: grep through the files the graph pointed to
+for f in training_funcs:
+    lr_lines = [l for l in repo_files[f['path']].split('\n')
+                if 'learning_rate' in l]
+
+# Semantic: discover connections the agent didn't know to look for
+similar_failures = semantic_search(
+    "training instability with this optimizer",
+    sources=["field_history", "github_issues"]
+)
+
+# RLM recursive: drill into the best semantic hit
+for hit in similar_failures[:2]:
+    fix = rlm_query("What fix resolved this instability?", hit['content'])
+
+# Combine evidence from all three into a single decision
+evidence = lr_lines + [(hit['source'], fix) for hit in similar_failures]
+```
+
+This unified approach means agents don't think in terms of "which layer am I using" — they think in terms of "what do I need to find?" and use whatever combination of tools makes sense in a single exploration step.
+
+### Unified Context REPL
 
 #### Core Principle
 
-Each ReproLab project maintains a **Context REPL** — a Python REPL environment with all project artifacts pre-loaded as variables. Agents write code in the REPL to inspect, filter, partition, and recursively query the context they need. The REPL is the primary exploration path; agents fall back to the Semantic Index when they need fuzzy discovery beyond what programmatic search can find.
+Each ReproLab project maintains a **Context REPL** — a Python REPL environment with all project artifacts pre-loaded as variables, plus `semantic_search()`, `graph_query()`, and `rlm_query()` as built-in functions. Agents write code in the REPL that freely combines raw variable exploration, semantic discovery, structural graph queries, and recursive sub-calls in a single session.
 
 #### Context REPL Variables
 
@@ -1093,40 +1122,46 @@ for filepath, content in relevant_files.items():
     )
 ```
 
-RLM handles precise, structured exploration. The Semantic Index catches what RLM misses — conceptual connections across documents that keyword search wouldn't surface.
+#### REPL Tools Reference
 
-#### Two-Layer Exploration Strategy
-
-| Dimension | Layer 1: RLM (primary) | Layer 2: Semantic Index (fallback) |
+| Tool | What it does | Best for |
 | --- | --- | --- |
-| Mechanism | Agent writes Python code in REPL | Agent sends natural-language query to vector store |
-| Best for | Precise, structured queries (versions, configs, specific sections) | Fuzzy discovery ("similar approaches", "related failures") |
-| Recall | Perfect — programmatic search sees everything | Depends on embedding quality and chunk boundaries |
-| Discovery | Limited to what the agent thinks to look for | Can surface unexpected connections |
-| Token cost | ~2-3k per recursive query | Depends on top-k and chunk size |
-| When used | First pass, always | Fallback when RLM doesn't find enough evidence; discovery of cross-document relationships |
+| Raw variables (`paper_text`, `repo_files`, etc.) | Direct Python access to all project artifacts | Precise structured queries — grep, filter, parse, slice |
+| `rlm_query(question, context)` | Recursive LLM sub-call over a specific context segment | Drilling into large text segments without exceeding token limits |
+| `semantic_search(query, sources, top_k)` | Fuzzy embedding-based retrieval from Chroma | Conceptual similarity, cross-document discovery, finding what the agent didn't know to look for |
+| `graph_query(entity_type, **relationships)` | Structural query against the knowledge graph | Code architecture navigation, entity relationships, concept clustering |
 
-**Example layered workflow:**
+All four tools are available simultaneously in every REPL session. Agents combine them freely:
 
 ```python
-# Step 1: RLM primary exploration
+# Example: Environment Detective finding PyTorch version
+# Uses all tools together — no fallback sequence
+
 torch_evidence = []
+
+# Raw variables: direct grep
 for line in requirements.split('\n'):
     if 'torch' in line.lower():
         torch_evidence.append(('requirements.txt', line.strip()))
 
-# Step 2: Not enough evidence? Fall back to semantic search
-if len(torch_evidence) < 2:
-    semantic_hits = semantic_search(
-        query="PyTorch version compatibility and installation",
-        sources=["github_issues", "field_history"],
-        top_k=5
-    )
-    # Step 3: Use RLM to recursively drill into semantic hits
-    for hit in semantic_hits:
-        detail = rlm_query("What PyTorch version is discussed?", hit['content'])
-        if detail:
-            torch_evidence.append((hit['source'], detail))
+# Graph: find which files import torch
+torch_importers = graph_query("module", imports="torch")
+for mod in torch_importers:
+    version_hints = [l for l in repo_files[mod['path']].split('\n')
+                     if 'version' in l.lower()]
+    torch_evidence.extend([(mod['path'], v) for v in version_hints])
+
+# Semantic: discover installation issues across field history
+install_hits = semantic_search(
+    "PyTorch version compatibility and CUDA installation",
+    sources=["github_issues", "field_history"], top_k=5
+)
+
+# RLM recursive: drill into each hit for specific version info
+for hit in install_hits:
+    detail = rlm_query("What PyTorch/CUDA version is discussed?", hit['content'])
+    if detail:
+        torch_evidence.append((hit['source'], detail))
 ```
 
 ### Shared Memory Objects
@@ -1161,14 +1196,13 @@ Final synthesis of promising directions, failed directions, inconclusive runs, b
 
 ### Context Rules
 
-- All agents share the same Context REPL variables, but each agent's system prompt scopes which variables are relevant.
+- All agents share the same Context REPL with all variables and all tools (`rlm_query()`, `semantic_search()`, `graph_query()`), but each agent's system prompt scopes which variables and tools are most relevant to its task.
 - Builder agents are directed toward repo, config, and paper method variables.
 - Verifier agents are directed toward paper claim map, reproduction contract, artifacts, logs, and assumption ledger variables.
 - Improvement agents are directed toward verified baseline variables rather than raw unresolved material.
 - Supervisor receives all verifier summaries and artifact indexes.
 - Long logs remain as full REPL variables; agents use programmatic exploration (grep, slice, filter) instead of receiving pre-summarized versions, preserving raw fidelity.
-- Agents use `rlm_query()` recursive sub-calls to drill into large variables without exceeding token limits.
-- Agents use `semantic_search()` as a fallback when RLM exploration doesn't find enough evidence, or for fuzzy conceptual discovery across field history and cross-document relationships.
+- Agents combine `rlm_query()`, `semantic_search()`, and `graph_query()` freely within a single exploration session — there is no prescribed order or fallback sequence.
 
 ### Shared State Write Protocol
 
@@ -1344,51 +1378,17 @@ for func in training_functions:
 
 **Production:** Move high-volume relationship queries to a dedicated graph database (Neo4j, etc.) if needed.
 
-#### Semantic Index (Layer 2 — fallback and discovery)
+#### Semantic Index
 
-Stores chunked text and code embeddings for fuzzy retrieval. This is the fallback layer when RLM programmatic exploration doesn't surface enough evidence, and the discovery layer for conceptual similarity across documents.
+Stores chunked text and code embeddings in Chroma for fuzzy retrieval via `semantic_search()`. Handles conceptual similarity and cross-document discovery that programmatic search would miss.
 
-Chunk types:
+Chunk types: paper paragraphs, equations, tables, appendix sections, config files, training/eval scripts, README sections, GitHub issues, dataset docs, related paper summaries.
 
-- Paper paragraphs.
-- Equations and surrounding explanation.
-- Tables and captions.
-- Appendix sections.
-- Config files.
-- Training and evaluation scripts.
-- README sections.
-- GitHub issues.
-- Dataset docs.
-- Related paper summaries.
+Each chunk preserves source metadata, section labels, commit hash when relevant, and extraction confidence.
 
-Each chunk should preserve source metadata, section labels, commit hash when relevant, and extraction confidence.
+#### Unified REPL Workspace
 
-Agents query this layer via `semantic_search()` when:
-
-- RLM exploration didn't find enough evidence for a decision.
-- The agent needs fuzzy conceptual matching (e.g., "similar training instabilities" across field history).
-- The agent wants to discover related content it didn't know to look for programmatically.
-
-Results from semantic search feed back into RLM: agents use `rlm_query()` to recursively drill into the returned chunks for deeper analysis.
-
-#### RLM Context REPL (Layer 1 — primary exploration)
-
-All raw text from the Artifact Index is loaded into REPL variables. Agents explore context by writing Python code in the REPL and using `rlm_query()` for recursive sub-queries over context segments. This is the primary exploration path — agents try RLM first before falling back to the Semantic Index.
-
-**Why RLM is the primary layer:**
-
-- No chunk boundary problems (agent decides how to partition).
-- Perfect recall for structured queries — agents can grep, filter, and inspect any part of the context.
-- Recursive sub-queries let agents drill into specific sections without loading everything into the prompt.
-- Token-efficient: ~2-3k tokens per recursive query vs. stuffing full context.
-- Agents can combine evidence from multiple variables in a single exploration step.
-
-**Why the Semantic Index is still needed:**
-
-- Fuzzy discovery — finding connections the agent didn't anticipate.
-- Conceptual similarity across documents that keyword search would miss.
-- Surfacing relevant field history when the agent doesn't know what to grep for.
-- Fallback when a paper uses non-standard terminology that programmatic search misses.
+All raw text from the Artifact Index is loaded into REPL variables. The Semantic Index and Knowledge Graph are exposed as `semantic_search()` and `graph_query()` functions within the same REPL. Agents use all tools together — no prescribed order.
 
 **REPL loading workflow:**
 
@@ -1396,13 +1396,12 @@ All raw text from the Artifact Index is loaded into REPL variables. Agents explo
 2. `artifact_discovery` finds repos, issues, datasets, and related resources.
 3. `context_loader` loads all discovered artifacts into the REPL as typed Python variables.
 4. Same artifacts are chunked and embedded into the Semantic Index.
-5. Agents receive the REPL handle, a `semantic_search()` function, and a scoped system prompt.
-6. Agents explore with REPL code first, fall back to `semantic_search()` when needed, then drill into semantic hits with `rlm_query()`.
-```
+5. Knowledge graph is built from code (Tree-sitter AST) and docs (LLM extraction).
+6. Agents receive the unified REPL with variables + `rlm_query()` + `semantic_search()` + `graph_query()` and a scoped system prompt.
 
 ### Per-Agent REPL Scopes
 
-Each agent shares the same Context REPL but receives a scoped system prompt directing it to the relevant variables. The agent uses Python code and `rlm_query()` sub-calls to explore only what it needs. Every agent also has access to `semantic_search()` as a fallback for fuzzy discovery.
+Each agent shares the same Context REPL (all variables + all tools: `rlm_query()`, `semantic_search()`, `graph_query()`) but receives a scoped system prompt directing it to the variables and tools most relevant to its task. Agents combine tools freely.
 
 #### Paper Understanding Agent Scope
 
