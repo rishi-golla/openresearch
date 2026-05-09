@@ -1,0 +1,75 @@
+"""Tests for backend.messaging.idempotency."""
+
+from __future__ import annotations
+
+import time
+from datetime import timedelta
+
+import pytest
+
+from backend.messaging.command import CommandId
+from backend.messaging.envelope import AggregateId, EventId
+from backend.messaging.idempotency import IdempotencyTable
+from backend.persistence.database import Database
+
+
+@pytest.fixture
+def db(tmp_path) -> Database:
+    db = Database(f"sqlite:///{tmp_path}/test.db")
+    db.connection  # noqa: B018  - eager init
+    yield db
+    db.close()
+
+
+def test_lookup_returns_none_for_unknown(db):
+    table = IdempotencyTable(db)
+    assert table.lookup(AggregateId("agg_1"), CommandId("cmd_1")) is None
+
+
+def test_record_then_lookup_returns_event_ids(db):
+    table = IdempotencyTable(db)
+    agg = AggregateId("agg_1")
+    cmd = CommandId("cmd_1")
+    eids = (EventId("evt_a"), EventId("evt_b"))
+
+    table.record(agg, cmd, eids)
+    db.connection.commit()
+
+    found = table.lookup(agg, cmd)
+    assert found == eids
+
+
+def test_record_replace_overwrites_prior_result(db):
+    table = IdempotencyTable(db)
+    agg = AggregateId("agg_1")
+    cmd = CommandId("cmd_1")
+
+    table.record(agg, cmd, (EventId("evt_first"),))
+    db.connection.commit()
+    table.record(agg, cmd, (EventId("evt_second"),))
+    db.connection.commit()
+
+    assert table.lookup(agg, cmd) == (EventId("evt_second"),)
+
+
+def test_lookup_treats_expired_rows_as_missing(db):
+    table = IdempotencyTable(db, default_retention=timedelta(milliseconds=10))
+    agg = AggregateId("agg_1")
+    cmd = CommandId("cmd_1")
+    table.record(agg, cmd, (EventId("evt_a"),))
+    db.connection.commit()
+
+    time.sleep(0.05)
+    assert table.lookup(agg, cmd) is None
+
+
+def test_purge_expired_removes_rows(db):
+    table = IdempotencyTable(db, default_retention=timedelta(milliseconds=10))
+    table.record(AggregateId("a1"), CommandId("c1"), (EventId("e1"),))
+    table.record(AggregateId("a2"), CommandId("c2"), (EventId("e2"),))
+    db.connection.commit()
+
+    time.sleep(0.05)
+    purged = table.purge_expired()
+    assert purged == 2
+    assert table.lookup(AggregateId("a1"), CommandId("c1")) is None
