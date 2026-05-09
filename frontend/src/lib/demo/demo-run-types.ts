@@ -4,6 +4,10 @@ export type DemoRunMode = "offline" | "sdk";
 
 export type DemoProvider = "anthropic" | "openai";
 
+export type DemoExecutionMode = "efficient" | "max";
+
+export type DemoSandboxMode = "local" | "docker";
+
 export type DemoRunStatus = "queued" | "running" | "completed" | "failed";
 
 export interface LiveDemoRunState {
@@ -11,6 +15,8 @@ export interface LiveDemoRunState {
   outputDir: string;
   runMode: DemoRunMode;
   llmProvider?: DemoProvider;
+  executionMode?: DemoExecutionMode;
+  sandboxMode?: DemoSandboxMode;
   status: DemoRunStatus;
   startedAt?: string;
   updatedAt?: string;

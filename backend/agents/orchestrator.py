@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.agents.registry import AGENT_REGISTRY
+from backend.agents.execution import ExecutionProfile, SandboxMode
 from backend.agents.runtime import (
     AgentRuntime,
     AgentRuntimeSpec,
@@ -194,12 +195,25 @@ class ReproLabOrchestrator:
         permission_mode: str = "bypassPermissions",
         provider: ProviderName | str | None = None,
         runtime: AgentRuntime | None = None,
+        execution_profile: ExecutionProfile | None = None,
+        sandbox_mode: SandboxMode | str = SandboxMode.docker,
     ) -> None:
         self.project_id = project_id
         self.runs_root = Path(runs_root)
         self.model = model
-        self.max_turns_per_agent = max_turns_per_agent
+        self.execution_profile = execution_profile or ExecutionProfile.from_mode(
+            "efficient"
+        )
+        self.max_turns_per_agent = (
+            max_turns_per_agent
+            if max_turns_per_agent != 15
+            else self.execution_profile.max_turns_per_agent
+        )
+        self.heavy_agent_max_turns = self.execution_profile.heavy_agent_max_turns
         self.permission_mode = permission_mode
+        self.sandbox_mode = SandboxMode(sandbox_mode)
+        if self.sandbox_mode is SandboxMode.simulate:
+            self.sandbox_mode = SandboxMode.local
         self._runtime = runtime or make_runtime(provider)
         self._project_dir = self.runs_root / project_id
         self._project_dir.mkdir(parents=True, exist_ok=True)
@@ -253,7 +267,11 @@ class ReproLabOrchestrator:
         """Invoke a single agent via the SDK and return its final text output."""
         # Implementation agents get more turns (they write code)
         if max_turns is None:
-            max_turns = 30 if agent_id in self._HEAVY_AGENTS else self.max_turns_per_agent
+            max_turns = (
+                self.heavy_agent_max_turns
+                if agent_id in self._HEAVY_AGENTS
+                else self.max_turns_per_agent
+            )
         runtime_spec = self._build_runtime_spec(
             agent_id,
             cwd=cwd,
@@ -569,14 +587,31 @@ class ReproLabOrchestrator:
         logger.info("[6/9] Running Experiment Runner Agent")
         if state.baseline_result is None:
             raise ValueError("Cannot run experiment before baseline implementation")
-        from backend.agents.experiment_runner import run_with_runtime
-
-        state.experiment_artifacts = await run_with_runtime(
-            self.project_id,
-            self.runs_root,
-            state.baseline_result,
-            state.reproduction_contract,
+        from backend.agents.experiment_runner import (
+            run_with_local_process,
+            run_with_runtime,
         )
+
+        if self.sandbox_mode is SandboxMode.local:
+            state.experiment_artifacts = await run_with_local_process(
+                self.project_id,
+                self.runs_root,
+                state.baseline_result,
+                state.reproduction_contract,
+                command_timeout=self.execution_profile.command_timeout_seconds,
+            )
+        else:
+            state.experiment_artifacts = await run_with_runtime(
+                self.project_id,
+                self.runs_root,
+                state.baseline_result,
+                state.reproduction_contract,
+                command_timeout=self.execution_profile.command_timeout_seconds,
+                network_disabled=self.execution_profile.sandbox_network_disabled,
+                memory_limit=self.execution_profile.sandbox_memory_limit,
+                cpus=self.execution_profile.sandbox_cpus,
+                platform=self.execution_profile.sandbox_platform,
+            )
         state.stage = PipelineStage.BASELINE_RUN
         return state
 

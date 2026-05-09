@@ -22,6 +22,7 @@ from backend.services.runtime import (
     DestroySandbox,
     ExecuteCommand,
     LocalDockerBackend,
+    LocalProcessBackend,
     RuntimeAppService,
     SandboxConfig,
     append_command_log,
@@ -166,6 +167,12 @@ async def run_with_runtime(
     *,
     runtime: RuntimeAppService | None = None,
     command_timeout: int = 3600,
+    network_disabled: bool = True,
+    memory_limit: str | None = "4g",
+    cpus: float | None = 2.0,
+    platform: str | None = None,
+    require_dockerfile: bool = True,
+    runtime_kind: str = "docker",
 ) -> ExperimentArtifacts:
     """Execute baseline commands in a real RuntimeBackend sandbox."""
 
@@ -173,25 +180,57 @@ async def run_with_runtime(
     project_dir = runs / project_id
     baseline_dir = initialize_run_artifacts(project_dir / "baseline")
     logs_dir = baseline_dir / "logs"
-    code_dir = Path(baseline_result.code_path) if baseline_result.code_path else project_dir / "code"
-    dockerfile_path = (
-        Path(baseline_result.dockerfile_path)
-        if baseline_result.dockerfile_path
-        else code_dir / "Dockerfile"
+    code_dir = _resolve_code_dir(project_dir, baseline_result)
+    dockerfile_path = _resolve_dockerfile_path(
+        project_dir,
+        code_dir,
+        baseline_result.dockerfile_path,
     )
     commands = baseline_result.commands_to_run or ["python train.py"]
 
     service = runtime or RuntimeAppService(LocalDockerBackend())
+    if not code_dir.exists():
+        return _runtime_failure_artifacts(
+            project_id,
+            baseline_dir,
+            baseline_result,
+            reproduction_contract,
+            [],
+            error_message=f"Code directory not found for sandbox execution: {code_dir}",
+            runtime_kind=runtime_kind,
+        )
+    if require_dockerfile and not dockerfile_path.exists():
+        return _runtime_failure_artifacts(
+            project_id,
+            baseline_dir,
+            baseline_result,
+            reproduction_contract,
+            [],
+            error_message=f"Dockerfile not found for sandbox execution: {dockerfile_path}",
+            runtime_kind=runtime_kind,
+        )
+
+    artifact_env = "/artifacts" if require_dockerfile else str(baseline_dir.resolve())
     config = SandboxConfig(
         project_id=project_id,
         run_id="baseline",
-        image=f"reprolab/{project_id}:baseline",
+        image=f"reprolab/{project_id}:baseline" if require_dockerfile else "local-process",
         project_root=code_dir,
         artifact_root=baseline_dir,
-        dockerfile_path=dockerfile_path if dockerfile_path.exists() else None,
-        build_context=code_dir if code_dir.exists() else None,
+        dockerfile_path=dockerfile_path if require_dockerfile else None,
+        build_context=code_dir if require_dockerfile else None,
         readonly_project=True,
-        environment={"OUTPUT_DIR": "/artifacts"},
+        network_disabled=network_disabled,
+        environment={
+            "OUTPUT_DIR": artifact_env,
+            "REPROLAB_ARTIFACT_DIR": artifact_env,
+            "MPLCONFIGDIR": f"{artifact_env}/.matplotlib",
+            "PYTHONUNBUFFERED": "1",
+        },
+        labels={"reprolab.run_kind": "baseline"},
+        platform=platform,
+        memory_limit=memory_limit,
+        cpus=cpus,
     )
 
     run_started_at = utc_now_iso()
@@ -249,6 +288,7 @@ async def run_with_runtime(
                     reproduction_contract,
                     command_results,
                     error_message=result.stderr or result.stdout or "Command failed",
+                    runtime_kind=runtime_kind,
                 )
 
         metrics_path = baseline_dir / "metrics.json"
@@ -264,6 +304,8 @@ async def run_with_runtime(
             image=sandbox.image,
             command_results=command_results,
             success=True,
+            runtime_kind=runtime_kind,
+            sandbox_config=_sandbox_config_payload(config),
         )
         write_provenance(baseline_dir, provenance)
         artifacts = ExperimentArtifacts(
@@ -284,10 +326,41 @@ async def run_with_runtime(
             reproduction_contract,
             command_results,
             error_message=f"{type(exc).__name__}: {exc}",
+            runtime_kind=runtime_kind,
         )
     finally:
         if sandbox is not None:
             await service.destroy(DestroySandbox(sandbox=sandbox))
+
+
+async def run_with_local_process(
+    project_id: str,
+    runs_root: Path,
+    baseline_result: BaselineResult,
+    reproduction_contract: ReproductionContract | None = None,
+    *,
+    command_timeout: int = 3600,
+) -> ExperimentArtifacts:
+    """Execute baseline commands on the host with artifact capture.
+
+    This is a fast local execution mode. It is intentionally not described as
+    a sandbox because it does not provide container isolation.
+    """
+
+    return await run_with_runtime(
+        project_id,
+        runs_root,
+        baseline_result,
+        reproduction_contract,
+        runtime=RuntimeAppService(LocalProcessBackend()),
+        command_timeout=command_timeout,
+        network_disabled=False,
+        memory_limit=None,
+        cpus=None,
+        platform=None,
+        require_dockerfile=False,
+        runtime_kind="local_process",
+    )
 
 
 async def run_with_sdk(
@@ -359,6 +432,7 @@ def _runtime_failure_artifacts(
     command_results: list[dict[str, Any]],
     *,
     error_message: str,
+    runtime_kind: str = "docker",
 ) -> ExperimentArtifacts:
     provenance = _provenance_payload(
         project_id,
@@ -371,6 +445,7 @@ def _runtime_failure_artifacts(
         command_results=command_results,
         success=False,
         error_message=error_message,
+        runtime_kind=runtime_kind,
     )
     write_provenance(baseline_dir, provenance)
     log_path = baseline_dir / "logs" / "run.log"
@@ -401,9 +476,12 @@ def _provenance_payload(
     command_results: list[dict[str, Any]],
     success: bool,
     error_message: str = "",
+    runtime_kind: str = "simulate",
+    sandbox_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "project_id": project_id,
+        "runtime_kind": runtime_kind,
         "mode": baseline_result.mode,
         "code_path": baseline_result.code_path,
         "dockerfile_path": baseline_result.dockerfile_path,
@@ -415,12 +493,71 @@ def _provenance_payload(
         "error_message": error_message,
         "commands": baseline_result.commands_to_run,
         "command_results": command_results,
+        "sandbox_config": sandbox_config or {},
         "assumptions_applied": baseline_result.assumptions_applied,
         "reproduction_contract": (
             reproduction_contract.model_dump(mode="json")
             if reproduction_contract is not None
             else {}
         ),
+    }
+
+
+def _resolve_code_dir(project_dir: Path, baseline_result: BaselineResult) -> Path:
+    raw = baseline_result.code_path.strip()
+    candidates: list[Path] = []
+    if raw:
+        supplied = Path(raw).expanduser()
+        if supplied.is_absolute():
+            candidates.append(supplied)
+        else:
+            candidates.append(project_dir / supplied)
+            candidates.append(Path(raw))
+    candidates.append(project_dir / "code")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return (project_dir / "code").resolve()
+
+
+def _resolve_dockerfile_path(
+    project_dir: Path,
+    code_dir: Path,
+    dockerfile_path: str,
+) -> Path:
+    raw = dockerfile_path.strip()
+    candidates: list[Path] = []
+    if raw:
+        supplied = Path(raw).expanduser()
+        if supplied.is_absolute():
+            candidates.append(supplied)
+        else:
+            candidates.append(project_dir / supplied)
+            candidates.append(code_dir / supplied)
+            candidates.append(Path(raw))
+    candidates.append(code_dir / "Dockerfile")
+    candidates.append(project_dir / "Dockerfile")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return (code_dir / "Dockerfile").resolve()
+
+
+def _sandbox_config_payload(config: SandboxConfig) -> dict[str, Any]:
+    return {
+        "project_root": str(config.project_root),
+        "artifact_root": str(config.resolved_artifact_root()),
+        "dockerfile_path": str(config.dockerfile_path) if config.dockerfile_path else "",
+        "build_context": str(config.build_context) if config.build_context else "",
+        "workdir": config.workdir,
+        "artifacts_dir": config.artifacts_dir,
+        "readonly_project": config.readonly_project,
+        "network_disabled": config.network_disabled,
+        "platform": config.platform,
+        "memory_limit": config.memory_limit,
+        "cpus": config.cpus,
     }
 
 

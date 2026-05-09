@@ -4,7 +4,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown } from "lucide-react";
 
 import { DashboardShell } from "@/features/dashboard/dashboard-shell";
-import type { DemoProvider, LiveDemoRunState } from "@/lib/demo/demo-run-types";
+import type {
+  DemoExecutionMode,
+  DemoProvider,
+  DemoSandboxMode,
+  LiveDemoRunState
+} from "@/lib/demo/demo-run-types";
 import { createMockEventAdapter } from "@/lib/events/mock-event-adapter";
 
 interface LiveDemoClientProps {
@@ -22,6 +27,34 @@ const PROVIDER_OPTIONS: Array<{ value: DemoProvider; label: string; helper: stri
     value: "openai",
     label: "OpenAI",
     helper: "OpenAI Agents SDK"
+  }
+];
+const EXECUTION_OPTIONS: Array<{
+  value: DemoExecutionMode;
+  label: string;
+  helper: string;
+}> = [
+  {
+    value: "efficient",
+    label: "Efficient",
+    helper: "Bounded budgets"
+  },
+  {
+    value: "max",
+    label: "Max",
+    helper: "Higher confidence"
+  }
+];
+const SANDBOX_OPTIONS: Array<{ value: DemoSandboxMode; label: string; helper: string }> = [
+  {
+    value: "local",
+    label: "Local",
+    helper: "Fast iteration"
+  },
+  {
+    value: "docker",
+    label: "Docker",
+    helper: "Container sandbox"
   }
 ];
 
@@ -55,10 +88,59 @@ function statusTone(status: LiveDemoRunState["status"] | "idle") {
   }
 }
 
+function SelectControl({
+  disabled,
+  id,
+  label,
+  onChange,
+  options,
+  value
+}: {
+  disabled: boolean;
+  id: string;
+  label: string;
+  onChange: (value: string) => void;
+  options: Array<{ value: string; label: string; helper: string }>;
+  value: string;
+}) {
+  return (
+    <label className="flex flex-col gap-2" htmlFor={id}>
+      <span className="text-xs font-semibold uppercase tracking-[0.18em] text-stone-400">
+        {label}
+      </span>
+      <span className="relative">
+        <select
+          className="w-full appearance-none rounded-xl border border-white/10 bg-stone-950 px-3 py-3 pr-9 text-sm font-semibold text-white outline-none transition focus:border-emerald-300/70 disabled:cursor-not-allowed disabled:text-stone-500"
+          disabled={disabled}
+          id={id}
+          onChange={(event) => onChange(event.target.value)}
+          value={value}
+        >
+          {options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label} - {option.helper}
+            </option>
+          ))}
+        </select>
+        <ChevronDown
+          aria-hidden="true"
+          className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400"
+        />
+      </span>
+    </label>
+  );
+}
+
 export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
   const [run, setRun] = useState(initialRun);
   const [sdkProvider, setSdkProvider] = useState<DemoProvider>(
     initialRun?.llmProvider ?? "anthropic"
+  );
+  const [executionMode, setExecutionMode] = useState<DemoExecutionMode>(
+    initialRun?.executionMode ?? "efficient"
+  );
+  const [sandboxMode, setSandboxMode] = useState<DemoSandboxMode>(
+    initialRun?.sandboxMode ?? "local"
   );
   const [runningMode, setRunningMode] = useState<"offline" | "sdk" | null>(
     initialRun && (initialRun.status === "queued" || initialRun.status === "running")
@@ -83,7 +165,13 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
     if (run?.llmProvider) {
       setSdkProvider(run.llmProvider);
     }
-  }, [run?.llmProvider]);
+    if (run?.executionMode) {
+      setExecutionMode(run.executionMode);
+    }
+    if (run?.sandboxMode) {
+      setSandboxMode(run.sandboxMode);
+    }
+  }, [run?.executionMode, run?.llmProvider, run?.sandboxMode]);
 
   useEffect(() => {
     if (run?.status !== "queued" && run?.status !== "running") {
@@ -98,10 +186,12 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
     const projectId = run.projectId;
     const providerParam =
       run.runMode === "sdk" && run.llmProvider ? `&provider=${run.llmProvider}` : "";
+    const executionParam = run.executionMode ? `&executionMode=${run.executionMode}` : "";
+    const sandboxParam = run.sandboxMode ? `&sandbox=${run.sandboxMode}` : "";
     pollTimer.current = window.setTimeout(async () => {
       try {
         const response = await fetch(
-          `/api/demo?projectId=${projectId}&mode=${run.runMode}${providerParam}`,
+          `/api/demo?projectId=${projectId}&mode=${run.runMode}${providerParam}${executionParam}${sandboxParam}`,
           { cache: "no-store" }
         );
         if (!response.ok) {
@@ -136,9 +226,12 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
 
     try {
       const providerParam = mode === "sdk" ? `&provider=${sdkProvider}` : "";
-      const response = await fetch(`/api/demo?mode=${mode}${providerParam}`, {
-        method: "POST"
-      });
+      const response = await fetch(
+        `/api/demo?mode=${mode}${providerParam}&executionMode=${executionMode}&sandbox=${sandboxMode}`,
+        {
+          method: "POST"
+        }
+      );
       if (!response.ok) {
         throw new Error(`Demo run failed with status ${response.status}`);
       }
@@ -157,6 +250,13 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
   const activeProvider = run?.llmProvider ?? sdkProvider;
   const activeProviderLabel =
     PROVIDER_OPTIONS.find((option) => option.value === activeProvider)?.label ?? "Anthropic";
+  const activeExecutionMode = run?.executionMode ?? executionMode;
+  const activeSandboxMode = run?.sandboxMode ?? sandboxMode;
+  const activeExecutionLabel =
+    EXECUTION_OPTIONS.find((option) => option.value === activeExecutionMode)?.label ??
+    "Efficient";
+  const activeSandboxLabel =
+    SANDBOX_OPTIONS.find((option) => option.value === activeSandboxMode)?.label ?? "Local";
 
   return (
     <main className="min-h-screen bg-stone-950 px-6 py-10 text-stone-100">
@@ -176,30 +276,31 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
             </p>
           </div>
 
-          <div className="flex w-full flex-col gap-3 rounded-2xl border border-white/10 bg-white/5 p-4 sm:w-auto sm:min-w-[18rem]">
-            <label
-              className="text-xs font-semibold uppercase tracking-[0.24em] text-stone-400"
-              htmlFor="sdk-provider"
-            >
-              SDK provider
-            </label>
-            <div className="relative">
-              <select
-                className="w-full appearance-none rounded-xl border border-white/10 bg-stone-950 px-4 py-3 pr-10 text-sm font-semibold text-white outline-none transition focus:border-emerald-300/70 disabled:cursor-not-allowed disabled:text-stone-500"
+          <div className="flex w-full flex-col gap-4 rounded-2xl border border-white/10 bg-white/5 p-4 sm:w-auto sm:min-w-[24rem]">
+            <div className="grid gap-3 sm:grid-cols-3">
+              <SelectControl
                 disabled={runningMode !== null}
                 id="sdk-provider"
-                onChange={(event) => setSdkProvider(event.target.value as DemoProvider)}
+                label="SDK provider"
+                onChange={(value) => setSdkProvider(value as DemoProvider)}
+                options={PROVIDER_OPTIONS}
                 value={sdkProvider}
-              >
-                {PROVIDER_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label} - {option.helper}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown
-                aria-hidden="true"
-                className="pointer-events-none absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400"
+              />
+              <SelectControl
+                disabled={runningMode !== null}
+                id="execution-mode"
+                label="Profile"
+                onChange={(value) => setExecutionMode(value as DemoExecutionMode)}
+                options={EXECUTION_OPTIONS}
+                value={executionMode}
+              />
+              <SelectControl
+                disabled={runningMode !== null}
+                id="sandbox-mode"
+                label="Sandbox"
+                onChange={(value) => setSandboxMode(value as DemoSandboxMode)}
+                options={SANDBOX_OPTIONS}
+                value={sandboxMode}
               />
             </div>
             <div className="flex flex-wrap gap-3">
@@ -232,8 +333,8 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
         {(currentStatus === "queued" || currentStatus === "running") && run ? (
           <div className="mt-6 rounded-2xl border border-sky-400/30 bg-sky-400/10 px-4 py-3 text-sm text-sky-50">
             {run.runMode === "sdk"
-              ? `The ${activeProviderLabel} SDK pipeline is running in the background. This page refreshes checkpoints every few seconds.`
-              : "The offline demo is running in the background. This page refreshes checkpoints every few seconds."}
+              ? `The ${activeProviderLabel} SDK pipeline is running with ${activeExecutionLabel.toLowerCase()} profile and ${activeSandboxLabel.toLowerCase()} execution. This page refreshes checkpoints every few seconds.`
+              : `The offline demo is running with ${activeExecutionLabel.toLowerCase()} profile and ${activeSandboxLabel.toLowerCase()} execution. This page refreshes checkpoints every few seconds.`}
           </div>
         ) : null}
 
@@ -256,8 +357,8 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
             </p>
             <p className="mt-2 text-sm leading-6 text-stone-400">
               {run?.runMode === "sdk"
-                ? `${activeProviderLabel} agent runtime using local credentials.`
-                : "Deterministic offline path for fast UI checks."}
+                ? `${activeProviderLabel} agents, ${activeExecutionLabel.toLowerCase()} profile, ${activeSandboxLabel.toLowerCase()} execution.`
+                : `Deterministic offline path, ${activeExecutionLabel.toLowerCase()} profile, ${activeSandboxLabel.toLowerCase()} execution.`}
             </p>
           </div>
 

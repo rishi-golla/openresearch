@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 
 import anyio
 
-from backend.agents.experiment_runner import run_offline, run_offline_failure, run_with_runtime
+from backend.agents.experiment_runner import (
+    run_offline,
+    run_offline_failure,
+    run_with_local_process,
+    run_with_runtime,
+)
 from backend.agents.schemas import BaselineResult, ExperimentArtifacts
 from backend.services.runtime import (
     ExecResult,
@@ -133,10 +138,81 @@ class TestRunWithRuntime:
         provenance = json.loads((run_dir / "provenance.json").read_text())
         assert provenance["sandbox_id"] == "fake_sandbox"
         assert provenance["success"] is True
+        assert provenance["runtime_kind"] == "docker"
+        assert provenance["sandbox_config"]["network_disabled"] is True
+
+    def test_resolves_generated_code_dir_when_agent_returns_container_path(self, tmp_path: Path):
+        async def scenario() -> tuple[ExperimentArtifacts, FakeRuntimeBackend]:
+            code_dir = tmp_path / "prj_runtime" / "code"
+            code_dir.mkdir(parents=True)
+            (code_dir / "Dockerfile").write_text("FROM python:3.11-slim\n")
+            backend = FakeRuntimeBackend()
+            baseline = BaselineResult(
+                mode="implement_from_paper",
+                code_path="/code",
+                dockerfile_path="/code/Dockerfile",
+                commands_to_run=["python train.py"],
+                assumptions_applied=["A001"],
+            )
+            artifacts = await run_with_runtime(
+                "prj_runtime",
+                tmp_path,
+                baseline,
+                runtime=RuntimeAppService(backend),
+                network_disabled=False,
+                memory_limit="2g",
+                cpus=1.5,
+                platform="linux/amd64",
+            )
+            return artifacts, backend
+
+        result, backend = anyio.run(scenario)
+        assert result.success is True
+        assert backend.config is not None
+        assert backend.config.project_root == (tmp_path / "prj_runtime" / "code").resolve()
+        assert backend.config.network_disabled is False
+        assert backend.config.memory_limit == "2g"
+        assert backend.config.cpus == 1.5
+        assert backend.config.platform == "linux/amd64"
+
+    def test_local_process_mode_runs_without_dockerfile(self, tmp_path: Path):
+        async def scenario() -> ExperimentArtifacts:
+            code_dir = tmp_path / "prj_local" / "code"
+            code_dir.mkdir(parents=True)
+            script = (
+                "import json, os, pathlib\n"
+                "out = pathlib.Path(os.environ['OUTPUT_DIR'])\n"
+                "out.mkdir(parents=True, exist_ok=True)\n"
+                "(out / 'metrics.json').write_text(json.dumps({'mean_reward': 12.5}))\n"
+                "print('local done')\n"
+            )
+            (code_dir / "train.py").write_text(script)
+            baseline = BaselineResult(
+                mode="implement_from_paper",
+                code_path=str(code_dir),
+                dockerfile_path="",
+                commands_to_run=["python train.py"],
+                assumptions_applied=["A001"],
+            )
+            return await run_with_local_process(
+                "prj_local",
+                tmp_path,
+                baseline,
+            )
+
+        result = anyio.run(scenario)
+        assert result.success is True
+        assert result.metrics["mean_reward"] == 12.5
+        provenance = json.loads((tmp_path / "prj_local" / "baseline" / "provenance.json").read_text())
+        assert provenance["runtime_kind"] == "local_process"
 
 
 class FakeRuntimeBackend(RuntimeBackend):
+    def __init__(self) -> None:
+        self.config: SandboxConfig | None = None
+
     async def create_sandbox(self, config: SandboxConfig) -> Sandbox:
+        self.config = config
         return Sandbox(
             sandbox_id="fake_sandbox",
             name="fake",

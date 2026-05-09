@@ -6,9 +6,11 @@ import path from "path";
 import { spawn } from "child_process";
 
 import type {
+  DemoExecutionMode,
   DemoProvider,
   DemoRunMode,
   DemoRunStatus,
+  DemoSandboxMode,
   LiveDemoRunState
 } from "./demo-run-types";
 import {
@@ -46,6 +48,8 @@ interface DemoRunStatusFile {
   outputDir: string;
   runMode: DemoRunMode;
   llmProvider?: DemoProvider;
+  executionMode?: DemoExecutionMode;
+  sandboxMode?: DemoSandboxMode;
   status: DemoRunStatus;
   startedAt: string;
   updatedAt: string;
@@ -113,7 +117,9 @@ function defaultMeta(
   projectId: string,
   outputDir: string,
   runMode: DemoRunMode,
-  llmProvider?: DemoProvider
+  llmProvider?: DemoProvider,
+  executionMode: DemoExecutionMode = "efficient",
+  sandboxMode: DemoSandboxMode = "local"
 ): LiveDemoMeta {
   return {
     projectId,
@@ -121,6 +127,8 @@ function defaultMeta(
     sourceKind: "workspace_fixture",
     runMode,
     llmProvider,
+    executionMode,
+    sandboxMode,
     sourceLabel: "In-repo PPO workspace fixture",
     sourceNote:
       "The repo currently does not contain a checked-in paper PDF, so this UI demo uses the deterministic PPO workspace fixture that already drives the end-to-end pipeline tests."
@@ -162,7 +170,9 @@ async function payloadForProject(
   projectId: string,
   runMode: DemoRunMode,
   log = "",
-  llmProvider?: DemoProvider
+  llmProvider?: DemoProvider,
+  executionMode: DemoExecutionMode = "efficient",
+  sandboxMode: DemoSandboxMode = "local"
 ) {
   const outputDir = runDir(projectId);
   const state = await readPipelineState(projectId);
@@ -172,7 +182,7 @@ async function payloadForProject(
 
   return buildLiveDemoDashboard(
     state,
-    defaultMeta(projectId, outputDir, runMode, llmProvider),
+    defaultMeta(projectId, outputDir, runMode, llmProvider, executionMode, sandboxMode),
     log
   );
 }
@@ -180,7 +190,9 @@ async function payloadForProject(
 function buildPythonScript(
   projectId: string,
   runMode: DemoRunMode,
-  llmProvider: DemoProvider
+  llmProvider: DemoProvider,
+  executionMode: DemoExecutionMode,
+  sandboxMode: DemoSandboxMode
 ): string {
   return `
 import asyncio
@@ -188,11 +200,14 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from backend.agents.execution import ExecutionProfile, SandboxMode
 from backend.agents.pipeline import run_pipeline_offline, run_pipeline_sdk
 
 workspace = json.loads(r'''${JSON.stringify(DEMO_WORKSPACE)}''')
 project_id = r'''${projectId}'''
 llm_provider = r'''${llmProvider}'''
+execution_mode = r'''${executionMode}'''
+sandbox_mode = r'''${sandboxMode}'''
 runs_root = Path(r'''${runsRoot()}''')
 output_dir = (runs_root / project_id).resolve()
 output_dir.mkdir(parents=True, exist_ok=True)
@@ -206,6 +221,8 @@ def write_status(status, error=None, completed_at=None):
         "projectId": project_id,
         "outputDir": str(output_dir),
         "runMode": "${runMode}",
+        "executionMode": execution_mode,
+        "sandboxMode": sandbox_mode,
         "status": status,
         "startedAt": started_at,
         "updatedAt": now(),
@@ -220,6 +237,7 @@ def write_status(status, error=None, completed_at=None):
 
 started_at = now()
 write_status("running")
+execution_profile = ExecutionProfile.from_mode(execution_mode)
 
 try:
     if "${runMode}" == "sdk":
@@ -230,9 +248,17 @@ try:
             provider=llm_provider,
             user_hints=["Keep this as a lightweight smoke test"],
             n_improvement_paths=1,
+            execution_profile=execution_profile,
+            sandbox_mode=SandboxMode(sandbox_mode),
         ))
     else:
-        run_pipeline_offline(project_id, runs_root, workspace)
+        run_pipeline_offline(
+            project_id,
+            runs_root,
+            workspace,
+            execution_profile=execution_profile,
+            sandbox_mode=SandboxMode(sandbox_mode),
+        )
     write_status("completed", completed_at=now())
 except Exception as exc:
     write_status("failed", error=f"{type(exc).__name__}: {exc}", completed_at=now())
@@ -242,7 +268,9 @@ except Exception as exc:
 
 async function latestProjectId(
   runMode?: DemoRunMode,
-  llmProvider?: DemoProvider
+  llmProvider?: DemoProvider,
+  executionMode?: DemoExecutionMode,
+  sandboxMode?: DemoSandboxMode
 ): Promise<string | null> {
   try {
     const entries = await fs.readdir(runsRoot(), { withFileTypes: true });
@@ -269,6 +297,13 @@ async function latestProjectId(
 
     const candidates = await Promise.all(
       filtered.map(async (entry) => {
+        const status = await readStatus(entry.name);
+        if (executionMode && status?.executionMode !== executionMode) {
+          return null;
+        }
+        if (sandboxMode && status?.sandboxMode !== sandboxMode) {
+          return null;
+        }
         const statusStat = await fs.stat(statusPath(entry.name)).catch(() => null);
         const pipelineStat = await fs.stat(pipelineStatePath(entry.name)).catch(() => null);
         const mtimeMs = Math.max(statusStat?.mtimeMs ?? 0, pipelineStat?.mtimeMs ?? 0);
@@ -290,8 +325,17 @@ async function inferState(projectId: string): Promise<LiveDemoRunState | null> {
   const status = await readStatus(projectId);
   const runMode: DemoRunMode = projectId.startsWith("ui_sdk_") ? "sdk" : "offline";
   const llmProvider = status?.llmProvider ?? providerFromProjectId(projectId);
+  const executionMode = status?.executionMode ?? "efficient";
+  const sandboxMode = status?.sandboxMode ?? "local";
   const log = await readLogTail(projectId);
-  const payload = await payloadForProject(projectId, runMode, log, llmProvider);
+  const payload = await payloadForProject(
+    projectId,
+    runMode,
+    log,
+    llmProvider,
+    executionMode,
+    sandboxMode
+  );
 
   if (status) {
     return {
@@ -299,6 +343,8 @@ async function inferState(projectId: string): Promise<LiveDemoRunState | null> {
       outputDir: status.outputDir,
       runMode: status.runMode,
       llmProvider,
+      executionMode,
+      sandboxMode,
       status: status.status,
       startedAt: status.startedAt,
       updatedAt: status.updatedAt,
@@ -315,6 +361,8 @@ async function inferState(projectId: string): Promise<LiveDemoRunState | null> {
       outputDir: payload.outputDir,
       runMode,
       llmProvider,
+      executionMode,
+      sandboxMode,
       status: "completed",
       payload,
       log: payload.log
@@ -336,9 +384,16 @@ function providerFromProjectId(projectId: string): DemoProvider | undefined {
 
 async function currentRunningRun(
   runMode: DemoRunMode,
-  llmProvider?: DemoProvider
+  llmProvider?: DemoProvider,
+  executionMode?: DemoExecutionMode,
+  sandboxMode?: DemoSandboxMode
 ): Promise<LiveDemoRunState | null> {
-  const projectId = await latestProjectId(runMode, llmProvider);
+  const projectId = await latestProjectId(
+    runMode,
+    llmProvider,
+    executionMode,
+    sandboxMode
+  );
   if (!projectId) {
     return null;
   }
@@ -349,9 +404,16 @@ async function currentRunningRun(
 
 export async function startDemoRun(
   runMode: DemoRunMode,
-  llmProvider: DemoProvider = "anthropic"
+  llmProvider: DemoProvider = "anthropic",
+  executionMode: DemoExecutionMode = "efficient",
+  sandboxMode: DemoSandboxMode = "local"
 ): Promise<LiveDemoRunState> {
-  const existing = await currentRunningRun(runMode, runMode === "sdk" ? llmProvider : undefined);
+  const existing = await currentRunningRun(
+    runMode,
+    runMode === "sdk" ? llmProvider : undefined,
+    executionMode,
+    sandboxMode
+  );
   if (existing) {
     return existing;
   }
@@ -368,6 +430,8 @@ export async function startDemoRun(
     outputDir,
     runMode,
     llmProvider: runMode === "sdk" ? llmProvider : undefined,
+    executionMode,
+    sandboxMode,
     status: "queued",
     startedAt: now,
     updatedAt: now
@@ -382,8 +446,17 @@ export async function startDemoRun(
   const usingPyLauncher =
     process.platform === "win32" && command === "py";
   const args = usingPyLauncher
-    ? ["-3", "-u", "-c", buildPythonScript(projectId, runMode, llmProvider)]
-    : ["-u", "-c", buildPythonScript(projectId, runMode, llmProvider)];
+    ? [
+        "-3",
+        "-u",
+        "-c",
+        buildPythonScript(projectId, runMode, llmProvider, executionMode, sandboxMode)
+      ]
+    : [
+        "-u",
+        "-c",
+        buildPythonScript(projectId, runMode, llmProvider, executionMode, sandboxMode)
+      ];
 
   const child = spawn(command, args, {
     cwd: repoRoot(),
@@ -404,6 +477,8 @@ export async function startDemoRun(
     outputDir,
     runMode,
     llmProvider: runMode === "sdk" ? llmProvider : undefined,
+    executionMode,
+    sandboxMode,
     status: "queued",
     payload: null,
     log: ""
@@ -413,9 +488,12 @@ export async function startDemoRun(
 export async function loadDemoRun(
   projectId?: string,
   runMode?: DemoRunMode,
-  llmProvider?: DemoProvider
+  llmProvider?: DemoProvider,
+  executionMode?: DemoExecutionMode,
+  sandboxMode?: DemoSandboxMode
 ): Promise<LiveDemoRunState | null> {
-  const resolvedProjectId = projectId ?? (await latestProjectId(runMode, llmProvider));
+  const resolvedProjectId =
+    projectId ?? (await latestProjectId(runMode, llmProvider, executionMode, sandboxMode));
   if (!resolvedProjectId) {
     return null;
   }

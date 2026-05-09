@@ -31,6 +31,7 @@ from backend.services.runtime.interface import (
     SandboxRuntimeError,
 )
 from backend.services.runtime.local_docker import LocalDockerBackend
+from backend.services.runtime.local_process import LocalProcessBackend
 from backend.services.runtime.service import (
     CreateSandbox,
     DestroySandbox,
@@ -48,6 +49,7 @@ __all__ = [
     "ExecuteCommand",
     "InvalidSandboxTransition",
     "LocalDockerBackend",
+    "LocalProcessBackend",
     "RuntimeAppService",
     "RuntimeBackend",
     "RuntimeCauseKind",

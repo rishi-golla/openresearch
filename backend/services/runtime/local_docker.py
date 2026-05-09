@@ -72,6 +72,12 @@ class LocalDockerBackend(RuntimeBackend):
             "volumes": volumes,
             "working_dir": config.workdir,
         }
+        if config.platform:
+            run_kwargs["platform"] = config.platform
+        if config.memory_limit:
+            run_kwargs["mem_limit"] = config.memory_limit
+        if config.cpus:
+            run_kwargs["nano_cpus"] = int(config.cpus * 1_000_000_000)
         if config.network_disabled:
             run_kwargs["network_mode"] = "none"
 
@@ -99,7 +105,7 @@ class LocalDockerBackend(RuntimeBackend):
             raw = await asyncio.wait_for(
                 asyncio.to_thread(
                     container.exec_run,
-                    command,
+                    ["/bin/sh", "-lc", command],
                     stdout=True,
                     stderr=True,
                     demux=True,
@@ -200,12 +206,17 @@ class LocalDockerBackend(RuntimeBackend):
             dockerfile_arg = dockerfile.name
         tag = config.image or f"reprolab/{config.project_id}:{config.run_id}"
         try:
+            build_kwargs: dict[str, Any] = {
+                "path": str(context),
+                "dockerfile": dockerfile_arg,
+                "tag": tag,
+                "rm": True,
+            }
+            if config.platform:
+                build_kwargs["platform"] = config.platform
             await asyncio.to_thread(
                 self.client.images.build,
-                path=str(context),
-                dockerfile=dockerfile_arg,
-                tag=tag,
-                rm=True,
+                **build_kwargs,
             )
         except Exception as exc:  # pragma: no cover - docker-specific branches
             raise _map_docker_error(exc, RuntimeCauseKind.build_failed) from exc

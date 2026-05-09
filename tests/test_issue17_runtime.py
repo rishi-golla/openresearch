@@ -15,6 +15,7 @@ from backend.services.runtime import (
     ExecuteCommand,
     ExecResult,
     LocalDockerBackend,
+    LocalProcessBackend,
     RuntimeAppService,
     RuntimeBackend,
     SandboxAggregate,
@@ -74,11 +75,13 @@ def test_local_docker_backend_delegates_lifecycle(tmp_path: Path) -> None:
         assert sandbox.sandbox_id == "ctr_1"
         assert client.containers.created_kwargs["volumes"][str(tmp_path)]["bind"] == "/work"
         assert client.containers.created_kwargs["network_mode"] == "none"
+        assert client.containers.created_kwargs["mem_limit"] == "4g"
+        assert client.containers.created_kwargs["nano_cpus"] == 2_000_000_000
 
         result = await backend.exec(sandbox, "python train.py", timeout=30)
         assert result.succeeded
         assert result.stdout == "ok"
-        assert client.containers.container.exec_calls == ["python train.py"]
+        assert client.containers.container.exec_calls == [["/bin/sh", "-lc", "python train.py"]]
 
         await backend.copy_in(sandbox, "/work/config.json", b"{}")
         assert client.containers.container.put_paths == ["/work"]
@@ -109,6 +112,36 @@ def test_runtime_service_records_events_without_store(tmp_path: Path) -> None:
         )
         await service.destroy(DestroySandbox(sandbox=sandbox))
         assert result.succeeded
+
+    anyio.run(scenario)
+
+
+def test_local_process_backend_executes_commands_with_artifact_env(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        code_dir = tmp_path / "code"
+        artifact_dir = tmp_path / "artifacts"
+        code_dir.mkdir()
+        backend = LocalProcessBackend()
+        config = SandboxConfig(
+            project_id="prj_local",
+            run_id="baseline",
+            image="local-process",
+            project_root=code_dir,
+            artifact_root=artifact_dir,
+            environment={"OUTPUT_DIR": str(artifact_dir)},
+        )
+
+        sandbox = await backend.create_sandbox(config)
+        result = await backend.exec(
+            sandbox,
+            "python -c \"import os, pathlib; pathlib.Path(os.environ['OUTPUT_DIR'], 'metrics.json').write_text('{\\\"ok\\\": true}'); print('done')\"",
+            timeout=30,
+        )
+        copied = await backend.copy_out(sandbox, "/artifacts/metrics.json")
+
+        assert result.succeeded
+        assert result.stdout.strip() == "done"
+        assert copied == b'{"ok": true}'
 
     anyio.run(scenario)
 

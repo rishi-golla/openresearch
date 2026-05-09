@@ -25,6 +25,7 @@ from backend.agents.schemas import (
     ResearchMap,
 )
 from backend.agents.orchestrator import PipelineStage, PipelineState
+from backend.agents.execution import ExecutionProfile, SandboxMode
 from backend.agents.runtime import AgentRuntime, ProviderName
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,8 @@ async def run_pipeline_sdk(
     user_hints: list[str] | None = None,
     n_improvement_paths: int = 3,
     resume: bool = True,
+    execution_profile: ExecutionProfile | None = None,
+    sandbox_mode: SandboxMode | str = SandboxMode.docker,
 ) -> PipelineState:
     """Run the full pipeline using the configured agent SDK provider.
 
@@ -55,6 +58,8 @@ async def run_pipeline_sdk(
         model=model,
         provider=provider,
         runtime=runtime,
+        execution_profile=execution_profile,
+        sandbox_mode=sandbox_mode,
     )
     return await orchestrator.run(
         resume=resume,
@@ -70,6 +75,8 @@ def run_pipeline_offline(
     *,
     user_hints: list[str] | None = None,
     n_improvement_paths: int = 3,
+    execution_profile: ExecutionProfile | None = None,
+    sandbox_mode: SandboxMode | str = SandboxMode.simulate,
 ) -> PipelineState:
     """Run the full pipeline WITHOUT an LLM (deterministic demo mode).
 
@@ -86,10 +93,14 @@ def run_pipeline_offline(
     from backend.agents.environment_detective import run_offline as env_detective
     from backend.agents.baseline_implementation import run_offline as baseline_impl
     from backend.agents.experiment_runner import run_offline as experiment_run
+    from backend.agents.experiment_runner import run_with_local_process
+    from backend.agents.experiment_runner import run_with_runtime as experiment_run_docker
     from backend.agents.verification import run_gate_offline, run_improvement_gate_offline
     from backend.agents.improvement import select_hypotheses_offline, run_path_offline
 
     runs = Path(runs_root)
+    profile = execution_profile or ExecutionProfile.from_mode("efficient")
+    resolved_sandbox_mode = SandboxMode(sandbox_mode)
     state = PipelineState(project_id=project_id)
 
     # --- Step 1: Paper Understanding ---
@@ -156,9 +167,40 @@ def run_pipeline_offline(
 
     # --- Step 6: Experiment Runner ---
     print(f"[6/9] Experiment Runner Agent", file=sys.stderr)
-    state.experiment_artifacts = experiment_run(
-        project_id, runs, state.baseline_result, state.reproduction_contract,
-    )
+    if resolved_sandbox_mode is SandboxMode.docker:
+        import anyio
+
+        async def _run_docker_experiment():
+            return await experiment_run_docker(
+                project_id,
+                runs,
+                state.baseline_result,
+                state.reproduction_contract,
+                command_timeout=profile.command_timeout_seconds,
+                network_disabled=profile.sandbox_network_disabled,
+                memory_limit=profile.sandbox_memory_limit,
+                cpus=profile.sandbox_cpus,
+                platform=profile.sandbox_platform,
+            )
+
+        state.experiment_artifacts = anyio.run(_run_docker_experiment)
+    elif resolved_sandbox_mode is SandboxMode.local:
+        import anyio
+
+        async def _run_local_experiment():
+            return await run_with_local_process(
+                project_id,
+                runs,
+                state.baseline_result,
+                state.reproduction_contract,
+                command_timeout=profile.command_timeout_seconds,
+            )
+
+        state.experiment_artifacts = anyio.run(_run_local_experiment)
+    else:
+        state.experiment_artifacts = experiment_run(
+            project_id, runs, state.baseline_result, state.reproduction_contract,
+        )
     state.stage = PipelineStage.BASELINE_RUN
     print(f"      Success: {state.experiment_artifacts.success}, "
           f"mean_reward: {state.experiment_artifacts.metrics.get('mean_reward', 'N/A')}", file=sys.stderr)

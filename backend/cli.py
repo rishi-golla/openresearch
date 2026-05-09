@@ -352,6 +352,24 @@ def cmd_reproduce(args: argparse.Namespace) -> int:
 
     # --- Phase 2: Agent Pipeline ---
     user_hints = [h.strip() for h in args.hints.split(",")] if args.hints else None
+    from backend.agents.execution import (
+        ExecutionProfile,
+        resolve_sandbox_mode,
+    )
+
+    execution_profile = ExecutionProfile.from_mode(
+        args.execution_mode,
+        command_timeout_seconds=args.command_timeout,
+        sandbox_network_disabled=not args.allow_sandbox_network,
+        sandbox_memory_limit=args.sandbox_memory,
+        sandbox_cpus=args.sandbox_cpus,
+        sandbox_platform=args.sandbox_platform,
+    )
+    sandbox_mode = resolve_sandbox_mode(args.sandbox, pipeline_mode=args.mode)
+    print(
+        f"Execution profile: {execution_profile.mode.value}; sandbox: {sandbox_mode.value}",
+        file=sys.stderr,
+    )
 
     if args.mode == "offline":
         from backend.agents.pipeline import run_pipeline_offline
@@ -360,6 +378,8 @@ def cmd_reproduce(args: argparse.Namespace) -> int:
             project_id, runs_root, workspace_claim_map,
             user_hints=user_hints,
             n_improvement_paths=args.n_paths,
+            execution_profile=execution_profile,
+            sandbox_mode=sandbox_mode,
         )
     else:
         from backend.agents.pipeline import run_pipeline_sdk
@@ -370,6 +390,8 @@ def cmd_reproduce(args: argparse.Namespace) -> int:
             provider=provider,
             user_hints=user_hints,
             n_improvement_paths=args.n_paths,
+            execution_profile=execution_profile,
+            sandbox_mode=sandbox_mode,
         ))
 
     # Print final summary
@@ -386,6 +408,8 @@ def cmd_reproduce(args: argparse.Namespace) -> int:
         "assumptions": len(state.assumption_ledger),
         "improvement_paths": len(state.path_results),
         "research_map": state.research_map is not None,
+        "execution_mode": execution_profile.mode.value,
+        "sandbox": sandbox_mode.value,
     }
     json.dump(result, sys.stdout, indent=2)
     sys.stdout.write("\n")
@@ -455,6 +479,48 @@ def main(argv: list[str] | None = None) -> int:
     )
     reproduce.add_argument("--hints", default=None, help="Comma-separated user hints for improvement.")
     reproduce.add_argument("--n-paths", type=int, default=3, help="Number of improvement paths.")
+    reproduce.add_argument(
+        "--execution-mode",
+        choices=("efficient", "max"),
+        default="efficient",
+        help="Execution profile: efficient keeps current bounded defaults; max raises budgets.",
+    )
+    reproduce.add_argument(
+        "--sandbox",
+        choices=("auto", "local", "docker"),
+        default="auto",
+        help=(
+            "Experiment backend: local runs commands on the host; docker is isolated; "
+            "auto uses Docker for SDK mode and deterministic simulation for offline mode."
+        ),
+    )
+    reproduce.add_argument(
+        "--command-timeout",
+        type=int,
+        default=None,
+        help="Override per-command sandbox timeout in seconds.",
+    )
+    reproduce.add_argument(
+        "--allow-sandbox-network",
+        action="store_true",
+        help="Allow network access inside Docker sandbox containers.",
+    )
+    reproduce.add_argument(
+        "--sandbox-platform",
+        default=None,
+        help="Optional Docker platform, e.g. linux/amd64 for cross-architecture runs.",
+    )
+    reproduce.add_argument(
+        "--sandbox-memory",
+        default=None,
+        help="Docker memory limit override, e.g. 4g or 8192m.",
+    )
+    reproduce.add_argument(
+        "--sandbox-cpus",
+        type=float,
+        default=None,
+        help="Docker CPU limit override.",
+    )
     reproduce.set_defaults(func=cmd_reproduce)
 
     args = parser.parse_args(argv)

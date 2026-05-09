@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "baseUrl": ".",
+    "ignoreDeprecations": "6.0",
     "target": "ES2022",
     "lib": [
       "dom",
@@ -14,6 +15,10 @@
     "esModuleInterop": true,
     "module": "esnext",
     "moduleResolution": "bundler",
+    "types": [
+      "node",
+      "vitest/globals"
+    ],
     "resolveJsonModule": true,
     "isolatedModules": true,
     "jsx": "react-jsx",

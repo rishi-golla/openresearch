@@ -52,6 +52,9 @@ class SandboxConfig(BaseModel):
     environment: dict[str, str] = Field(default_factory=dict)
     labels: dict[str, str] = Field(default_factory=dict)
     keepalive_command: tuple[str, ...] = ("sleep", "infinity")
+    platform: str | None = None
+    memory_limit: str | None = "4g"
+    cpus: float | None = 2.0
 
     def resolved_artifact_root(self) -> Path:
         return self.artifact_root or self.project_root / "artifacts"

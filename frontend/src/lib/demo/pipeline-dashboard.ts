@@ -4,7 +4,11 @@ import type {
   DashboardSnapshot,
   ProgressStatus
 } from "@/lib/events/contract";
-import type { DemoProvider } from "./demo-run-types";
+import type {
+  DemoExecutionMode,
+  DemoProvider,
+  DemoSandboxMode
+} from "./demo-run-types";
 
 type GateStatus =
   | "verified"
@@ -96,6 +100,8 @@ export interface LiveDemoMeta {
   sourceKind: "repo_pdf" | "workspace_fixture";
   runMode: "offline" | "sdk";
   llmProvider?: DemoProvider;
+  executionMode?: DemoExecutionMode;
+  sandboxMode?: DemoSandboxMode;
   sourceLabel: string;
   sourceNote: string;
 }
@@ -111,6 +117,8 @@ export interface LiveDemoPayload extends LiveDemoMeta {
     improvementCount: number;
     runModeLabel: string;
     llmProvider?: DemoProvider;
+    executionMode?: DemoExecutionMode;
+    sandboxMode?: DemoSandboxMode;
     sourceLabel: string;
   };
 }
@@ -123,6 +131,10 @@ function runModeLabel(runMode: LiveDemoMeta["runMode"], provider?: DemoProvider)
     return "SDK";
   }
   return provider === "openai" ? "SDK: OpenAI" : "SDK: Anthropic";
+}
+
+function sandboxLabel(mode?: DemoSandboxMode): string {
+  return mode === "docker" ? "Docker sandbox" : "Local";
 }
 
 function toStatusTone(status?: GateStatus): ProgressStatus {
@@ -257,6 +269,7 @@ function buildInitialSnapshot(
           `Implementation mode: ${state.baseline_result?.mode ?? "pending"}`,
           `Applied assumptions: ${(state.baseline_result?.assumptions_applied ?? []).join(", ") || "Pending"}`,
           `Run mode: ${runModeLabel(meta.runMode, meta.llmProvider)}`,
+          `Execution: ${meta.executionMode ?? "efficient"} / ${sandboxLabel(meta.sandboxMode)}`,
           meta.sourceNote
         ]
       },
@@ -669,6 +682,8 @@ export function buildLiveDemoDashboard(
       improvementCount: pathResults.length,
       runModeLabel: runModeLabel(meta.runMode, meta.llmProvider),
       llmProvider: meta.llmProvider,
+      executionMode: meta.executionMode,
+      sandboxMode: meta.sandboxMode,
       sourceLabel: meta.sourceLabel
     }
   };

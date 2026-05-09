@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 
-import type { DemoProvider } from "@/lib/demo/demo-run-types";
+import type {
+  DemoExecutionMode,
+  DemoProvider,
+  DemoSandboxMode
+} from "@/lib/demo/demo-run-types";
 import { loadDemoRun, startDemoRun } from "@/lib/demo/node-runner";
 
 export const runtime = "nodejs";
@@ -29,11 +33,31 @@ function toProvider(request: Request): DemoProvider | undefined {
   return undefined;
 }
 
+function toExecutionMode(request: Request): DemoExecutionMode | undefined {
+  const url = new URL(request.url);
+  const value = url.searchParams.get("executionMode");
+  if (value === "efficient" || value === "max") {
+    return value;
+  }
+  return undefined;
+}
+
+function toSandboxMode(request: Request): DemoSandboxMode | undefined {
+  const url = new URL(request.url);
+  const value = url.searchParams.get("sandbox");
+  if (value === "local" || value === "docker") {
+    return value;
+  }
+  return undefined;
+}
+
 export async function GET(request: Request) {
   const latest = await loadDemoRun(
     toProjectId(request),
     toRunMode(request),
-    toProvider(request)
+    toProvider(request),
+    toExecutionMode(request),
+    toSandboxMode(request)
   );
   return NextResponse.json(latest);
 }
@@ -42,7 +66,9 @@ export async function POST(request: Request) {
   try {
     const run = await startDemoRun(
       toRunMode(request) ?? "offline",
-      toProvider(request) ?? "anthropic"
+      toProvider(request) ?? "anthropic",
+      toExecutionMode(request) ?? "efficient",
+      toSandboxMode(request) ?? "local"
     );
     return NextResponse.json(run, { status: 202 });
   } catch (error) {

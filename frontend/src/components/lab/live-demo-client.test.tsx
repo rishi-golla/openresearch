@@ -28,12 +28,21 @@ describe("LiveDemoClient", () => {
     fireEvent.change(screen.getByLabelText(/sdk provider/i), {
       target: { value: "openai" }
     });
+    fireEvent.change(screen.getByLabelText(/profile/i), {
+      target: { value: "max" }
+    });
+    fireEvent.change(screen.getByLabelText(/sandbox/i), {
+      target: { value: "docker" }
+    });
     fireEvent.click(screen.getByRole("button", { name: /run sdk/i }));
 
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith("/api/demo?mode=sdk&provider=openai", {
-        method: "POST"
-      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/demo?mode=sdk&provider=openai&executionMode=max&sandbox=docker",
+        {
+          method: "POST"
+        }
+      );
     });
   });
 });
