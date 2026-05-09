@@ -23,7 +23,13 @@ The slice is intentionally narrow: one source kind (PdfPath), one parser (PyMuPD
 
 ## 2. Approach
 
-Five sequential commits, each independently mergeable, each with passing tests + `mypy --strict` clean. Coordinator-free for this slice — the CLI wires the pipeline directly. Coordinators come in later when concurrency matters.
+Five **sequentially mergeable** commits — each commit on its own is shippable as a green-tested unit, but they must land in order because each depends on the prior aggregate's `*_COMPLETED` state. Coordinator-free for this slice — the CLI wires the pipeline directly. Coordinators come in later when concurrency matters.
+
+Codex review (2026-05-09) flagged this dependency chain explicitly; we acknowledge it rather than overstate independence:
+- Commit 2 (parser) requires Commit 1's `ProjectAggregate` reaching `FETCHED`.
+- Commit 3 (indexer) requires Commit 2's `ParsedPaperAggregate` reaching `PARSED`.
+- Commit 4 (workspace) requires Commit 3's `IndexAggregate` reaching `INDEXED` and reads from Commit 2's parsed sections for the `claim_map` preload.
+- Commit 5 (CLI + e2e) wires all four.
 
 ```
 Commit 1: Intake (#12)
@@ -193,7 +199,9 @@ class Chunk(BaseModel):
     chunk_type: ChunkType
 ```
 
-**`SectionChunker`**: one chunk per section (whole-section text). ParagraphChunker is deferred.
+**`SectionChunker`**: one chunk per section. To make ChunkIds deterministic across re-ingest (Codex feedback 2026-05-09), the chunker sorts incoming sections by `(depth, char_offset, section_id)` before chunking. This pin guarantees that re-running the indexer on the same parsed paper produces byte-identical SourceIds and ChunkIds even if the parser's emit order shifts.
+
+ParagraphChunker is deferred.
 
 **`IndexerAppService.handle_start_indexing`**:
 1. Load `ProjectAggregate`; require state == FETCHED or METADATA_KNOWN.
@@ -226,7 +234,7 @@ class Chunk(BaseModel):
 
 **Tools**:
 - `WorkspaceTool` Protocol with `name`, `call(workspace, **kwargs) -> Cited[Any]`.
-- `LookupTool` — exact source lookup against the SourcesProjection. Returns `Cited[SourceRef]` whose citations are `(Citation(source_id=src.id, quote=src.locator, locator=src.locator),)`.
+- `LookupTool` — exact source lookup against the SourcesProjection. Returns `Cited[SourceRef]` whose citations carry an **evidence-grade `quote`** taken from the source's first chunk text (truncated to 240 chars), not a recycled locator. Per Codex feedback: locator goes in `Citation.locator`; quote must be actual evidence text.
 
 **`WorkspaceAppService.handle_build_workspace`**:
 1. Load `ProjectAggregate`; require state == FETCHED or METADATA_KNOWN.
@@ -285,6 +293,8 @@ For the plan to be considered complete (every box must be a real test):
 - Coordinators / process managers — slice uses sequential CLI
 - Dashboard event payload bridge — separate follow-up
 - Subprocess isolation for the parser (spec §8.10) — follow-up
+- **Byte-identical replay (spec §8.5)** — downgraded to **SourceId/ChunkId stability** for this slice. The slice does NOT yet guarantee identical event payloads on re-run because `parse_duration_ms` and `occurred_at` vary. The full byte-identical replay requirement comes back in a follow-up that adds a `Clock` injection + parse-duration redaction. Codex review 2026-05-09 flagged this as the quietest spec downgrade; documenting it explicitly here.
+- **Spec closure for #12, #13, #15, #16** — none of these issues are *closed* by this slice. Each remains open for follow-ups (arXiv intake, Nougat parser, embeddings, additional tools).
 
 ## 8. Risks
 
