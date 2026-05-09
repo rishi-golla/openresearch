@@ -54,8 +54,30 @@ from backend.agents.telemetry import (
     coerce_usage,
     utc_now_iso,
 )
+from backend.hermes_audit import (
+    HermesAuditReport,
+    HermesAuditScope,
+    HermesAuditService,
+    HermesAuditStatus,
+    HermesAuditStorage,
+    HermesInterventionType,
+    NousHermesClient,
+    build_checkpoint_audit_payload,
+    build_step_audit_payload,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AgentExecutionTrace:
+    """Trace metadata captured for one agent invocation."""
+
+    agent_id: str
+    output_text: str
+    trace_text: str
+    tool_calls: list[str] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
 
 
 class PipelineStage(str, enum.Enum):
@@ -97,6 +119,9 @@ class PipelineState:
     research_map: ResearchMap | None = None
     assumption_ledger: list[dict[str, Any]] = field(default_factory=list)
     decision_log: list[str] = field(default_factory=list)
+    hermes_step_reports: dict[str, list[HermesAuditReport]] = field(default_factory=dict)
+    hermes_checkpoint_reports: dict[str, list[HermesAuditReport]] = field(default_factory=dict)
+    hermes_interventions: list[dict[str, Any]] = field(default_factory=list)
 
     def save_checkpoint(self, runs_root: Path) -> Path:
         """Persist pipeline state to disk for crash-resume."""
@@ -131,6 +156,18 @@ class PipelineState:
             data["improvement_hypotheses"] = [h.model_dump() for h in self.improvement_hypotheses]
         if self.path_results:
             data["path_results"] = [r.model_dump() for r in self.path_results]
+        if self.hermes_step_reports:
+            data["hermes_step_reports"] = {
+                key: [report.model_dump() for report in reports]
+                for key, reports in self.hermes_step_reports.items()
+            }
+        if self.hermes_checkpoint_reports:
+            data["hermes_checkpoint_reports"] = {
+                key: [report.model_dump() for report in reports]
+                for key, reports in self.hermes_checkpoint_reports.items()
+            }
+        if self.hermes_interventions:
+            data["hermes_interventions"] = self.hermes_interventions
         path.write_text(json.dumps(data, indent=2))
         logger.info("Checkpoint saved: stage=%s path=%s", self.stage.value, path)
         return path
@@ -170,6 +207,17 @@ class PipelineState:
             ]
         if "path_results" in data:
             state.path_results = [PathResult(**r) for r in data["path_results"]]
+        if "hermes_step_reports" in data:
+            state.hermes_step_reports = {
+                key: [HermesAuditReport(**report) for report in reports]
+                for key, reports in data["hermes_step_reports"].items()
+            }
+        if "hermes_checkpoint_reports" in data:
+            state.hermes_checkpoint_reports = {
+                key: [HermesAuditReport(**report) for report in reports]
+                for key, reports in data["hermes_checkpoint_reports"].items()
+            }
+        state.hermes_interventions = data.get("hermes_interventions", [])
         logger.info("Checkpoint loaded: stage=%s", state.stage.value)
         return state
 
@@ -197,6 +245,7 @@ class ReproLabOrchestrator:
         runtime: AgentRuntime | None = None,
         execution_profile: ExecutionProfile | None = None,
         sandbox_mode: SandboxMode | str = SandboxMode.docker,
+        hermes_audit_service: HermesAuditService | None = None,
     ) -> None:
         self.project_id = project_id
         self.runs_root = Path(runs_root)
@@ -219,6 +268,11 @@ class ReproLabOrchestrator:
         self._project_dir.mkdir(parents=True, exist_ok=True)
         self._telemetry = AgentTelemetryRecorder(
             self._project_dir / "agent_telemetry.jsonl"
+        )
+        self._latest_agent_traces: dict[str, AgentExecutionTrace] = {}
+        self._hermes_audit_service = hermes_audit_service or HermesAuditService(
+            client=NousHermesClient(),
+            storage=HermesAuditStorage(self.runs_root, project_id),
         )
 
     # Agents that write code / run experiments need more turns
@@ -285,6 +339,8 @@ class ReproLabOrchestrator:
 
         collected_text: list[str] = []
         started_at = utc_now_iso()
+        trace_lines: list[str] = []
+        tool_calls: list[str] = []
         t0 = time.time()
         msg_count = 0
         success = True
@@ -301,6 +357,7 @@ class ReproLabOrchestrator:
                 msg_count += 1
                 if isinstance(event, StreamText):
                     collected_text.append(event.text)
+                    trace_lines.append(event.text)
                     snippet = event.text[:120].replace("\n", " ").strip()
                     if snippet:
                         print(
@@ -318,6 +375,8 @@ class ReproLabOrchestrator:
                         tool_info += f" `{cmd}`"
                     elif "pattern" in inp:
                         tool_info += f" {inp['pattern']}"
+                    tool_calls.append(tool_info)
+                    trace_lines.append(f"tool: {tool_info}")
                     print(
                         f"  [{agent_id}] ({elapsed:.0f}s) tool: {tool_info}",
                         file=sys.stderr,
@@ -351,7 +410,6 @@ class ReproLabOrchestrator:
                     usage=usage,
                 )
             )
-
         result = "\n".join(collected_text)
         if not result.strip():
             print(
@@ -360,6 +418,13 @@ class ReproLabOrchestrator:
                 flush=True,
             )
         logger.info("Agent %s completed (%d chars output)", agent_id, len(result))
+        self._latest_agent_traces[agent_id] = AgentExecutionTrace(
+            agent_id=agent_id,
+            output_text=result,
+            trace_text="\n".join(trace_lines),
+            tool_calls=tool_calls,
+            elapsed_seconds=time.time() - t0,
+        )
         return result
 
     def _normalize_verifier_scores(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -372,6 +437,8 @@ class ReproLabOrchestrator:
                 # LLM sometimes returns 0-100 scores instead of 0.0-1.0
                 if "score" in vs and isinstance(vs["score"], (int, float)) and vs["score"] > 1.0:
                     vs["score"] = vs["score"] / 100.0
+                if "severity" not in vs or not vs["severity"]:
+                    vs["severity"] = "medium" if vs.get("mismatches") else "low"
         return data
 
     def _normalize_reproduction_contract(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -446,6 +513,170 @@ class ReproLabOrchestrator:
 
         raise ValueError(f"No JSON found in agent output: {text[:200]}")
 
+    def _state_snapshot_for_audit(self, state: PipelineState) -> dict[str, Any]:
+        snapshot: dict[str, Any] = {
+            "project_id": state.project_id,
+            "stage": state.stage.value,
+            "assumption_ledger": state.assumption_ledger,
+            "decision_log": state.decision_log,
+        }
+        if state.paper_claim_map:
+            snapshot["paper_claim_map"] = state.paper_claim_map.model_dump()
+        if state.environment_spec:
+            snapshot["environment_spec"] = state.environment_spec.model_dump()
+        if state.reproduction_contract:
+            snapshot["reproduction_contract"] = state.reproduction_contract.model_dump()
+        if state.baseline_result:
+            snapshot["baseline_result"] = state.baseline_result.model_dump()
+        if state.experiment_artifacts:
+            snapshot["experiment_artifacts"] = state.experiment_artifacts.model_dump()
+        if state.path_results:
+            snapshot["path_results"] = [result.model_dump() for result in state.path_results]
+        if state.research_map:
+            snapshot["research_map"] = state.research_map.model_dump()
+        return snapshot
+
+    def _artifact_paths_for_state(self, state: PipelineState) -> list[str]:
+        paths: list[str] = []
+        if state.baseline_result:
+            for path in [state.baseline_result.code_path, state.baseline_result.dockerfile_path]:
+                if path:
+                    paths.append(path)
+        if state.experiment_artifacts:
+            for path in [
+                state.experiment_artifacts.log_path,
+                state.experiment_artifacts.commands_log_path,
+                state.experiment_artifacts.provenance_path,
+                *state.experiment_artifacts.plots,
+            ]:
+                if path:
+                    paths.append(path)
+        for result in state.path_results:
+            paths.extend([plot for plot in result.plots if plot])
+        return paths
+
+    def _append_hermes_report(self, state: PipelineState, report: HermesAuditReport) -> None:
+        collection = (
+            state.hermes_step_reports
+            if report.scope == HermesAuditScope.step
+            else state.hermes_checkpoint_reports
+        )
+        collection.setdefault(report.target, []).append(report)
+        if report.recommended_intervention != HermesInterventionType.annotate:
+            state.hermes_interventions.append(
+                {
+                    "target": report.target,
+                    "scope": report.scope.value,
+                    "action": report.recommended_intervention.value,
+                    "reason": report.summary,
+                    "status": report.status.value,
+                }
+            )
+
+    def _downgrade_gate_status(self, status: GateStatus) -> GateStatus:
+        if status == GateStatus.verified:
+            return GateStatus.verified_with_caveats
+        if status == GateStatus.verified_with_caveats:
+            return GateStatus.partial_reproduction
+        if status == GateStatus.partial_reproduction:
+            return GateStatus.failed_reproduction
+        return status
+
+    def _apply_checkpoint_report_to_gate(
+        self,
+        state: PipelineState,
+        report: HermesAuditReport,
+        gate_decision: GateDecision,
+    ) -> GateDecision:
+        if report.status != HermesAuditStatus.unsupported:
+            return gate_decision
+        if report.recommended_intervention in {
+            HermesInterventionType.downgrade_claim,
+            HermesInterventionType.suppress_publication,
+            HermesInterventionType.escalate_human,
+        }:
+            downgraded = self._downgrade_gate_status(gate_decision.status)
+            gate_decision.status = downgraded
+            gate_decision.passed = downgraded in (
+                GateStatus.verified,
+                GateStatus.verified_with_caveats,
+            )
+            gate_decision.blocking_issues.extend(report.unsupported_claims or [report.summary])
+        return gate_decision
+
+    def _apply_research_map_intervention(
+        self,
+        state: PipelineState,
+        report: HermesAuditReport,
+    ) -> None:
+        if not state.research_map:
+            return
+        if report.recommended_intervention != HermesInterventionType.suppress_publication:
+            return
+        remaining: list[str] = []
+        moved: list[str] = []
+        for direction in state.research_map.promising_directions:
+            if any(claim.lower() in direction.lower() for claim in report.unsupported_claims):
+                moved.append(direction)
+            else:
+                remaining.append(direction)
+        state.research_map.promising_directions = remaining
+        for direction in moved:
+            if direction not in state.research_map.inconclusive:
+                state.research_map.inconclusive.append(f"Hermes suppressed: {direction}")
+        if report.summary:
+            state.research_map.overall_reproducibility_assessment = (
+                state.research_map.overall_reproducibility_assessment + f" Hermes note: {report.summary}"
+            ).strip()
+
+    def _audit_step(
+        self,
+        state: PipelineState,
+        *,
+        target: str,
+        structured_output: dict[str, Any],
+    ) -> HermesAuditReport:
+        trace = self._latest_agent_traces.get(target)
+        payload = build_step_audit_payload(
+            project_id=self.project_id,
+            target=target,
+            state_snapshot=self._state_snapshot_for_audit(state),
+            structured_output=structured_output,
+            trace_text=trace.trace_text if trace else "",
+            artifact_paths=self._artifact_paths_for_state(state),
+        )
+        report = self._hermes_audit_service.audit(
+            scope=HermesAuditScope.step,
+            target=target,
+            payload=payload,
+        )
+        self._append_hermes_report(state, report)
+        return report
+
+    def _audit_checkpoint(
+        self,
+        state: PipelineState,
+        *,
+        target: str,
+        evidence_bundle: dict[str, Any],
+        trace_text: str = "",
+    ) -> HermesAuditReport:
+        payload = build_checkpoint_audit_payload(
+            project_id=self.project_id,
+            target=target,
+            state_snapshot=self._state_snapshot_for_audit(state),
+            evidence_bundle=evidence_bundle,
+            trace_text=trace_text,
+            artifact_paths=self._artifact_paths_for_state(state),
+        )
+        report = self._hermes_audit_service.audit(
+            scope=HermesAuditScope.checkpoint,
+            target=target,
+            payload=payload,
+        )
+        self._append_hermes_report(state, report)
+        return report
+
     async def run_paper_understanding(self, state: PipelineState) -> PipelineState:
         """Step 1: Paper Understanding Agent."""
         logger.info("[1/9] Running Paper Understanding Agent")
@@ -462,6 +693,11 @@ class ReproLabOrchestrator:
         # Merge ambiguities into assumption ledger
         for amb in state.paper_claim_map.ambiguities:
             state.assumption_ledger.append(amb.model_dump())
+        self._audit_step(
+            state,
+            target="paper-understanding",
+            structured_output=state.paper_claim_map.model_dump(),
+        )
         state.stage = PipelineStage.PAPER_UNDERSTOOD
         return state
 
@@ -477,6 +713,11 @@ class ReproLabOrchestrator:
         output = await self._invoke_agent("artifact-discovery", prompt)
         state.artifact_index = self._extract_json(
             output, fallback_file=str(self._project_dir / "artifact_index.json"),
+        )
+        self._audit_step(
+            state,
+            target="artifact-discovery",
+            structured_output=state.artifact_index,
         )
         state.stage = PipelineStage.ARTIFACTS_DISCOVERED
         return state
@@ -501,6 +742,11 @@ class ReproLabOrchestrator:
         # Merge environment assumptions
         for assumption in state.environment_spec.assumptions:
             state.assumption_ledger.append(assumption.model_dump())
+        self._audit_step(
+            state,
+            target="environment-detective",
+            structured_output=state.environment_spec.model_dump(),
+        )
         state.stage = PipelineStage.ENVIRONMENT_BUILT
         return state
 
@@ -524,6 +770,11 @@ class ReproLabOrchestrator:
             )
         )
         state.reproduction_contract = ReproductionContract(**data)
+        self._audit_step(
+            state,
+            target="reproduction-planner",
+            structured_output=state.reproduction_contract.model_dump(),
+        )
         state.stage = PipelineStage.PLAN_CREATED
         return state
 
@@ -550,6 +801,13 @@ class ReproLabOrchestrator:
             passed=report.status in (GateStatus.verified, GateStatus.verified_with_caveats),
             status=report.status,
         )
+        checkpoint_report = self._audit_checkpoint(
+            state,
+            target="gate_1",
+            evidence_bundle=context | {"verification_report": report.model_dump()},
+            trace_text=output,
+        )
+        state.gate_1 = self._apply_checkpoint_report_to_gate(state, checkpoint_report, state.gate_1)
         state.decision_log.append(report.decision_log_entry)
         state.stage = PipelineStage.GATE_1_PASSED
         state.save_checkpoint(self.runs_root)
@@ -579,6 +837,11 @@ class ReproLabOrchestrator:
             output, fallback_file=str(self._project_dir / "baseline_result.json"),
         )
         state.baseline_result = BaselineResult(**data)
+        self._audit_step(
+            state,
+            target="baseline-implementation",
+            structured_output=state.baseline_result.model_dump(),
+        )
         state.stage = PipelineStage.BASELINE_IMPLEMENTED
         return state
 
@@ -612,6 +875,11 @@ class ReproLabOrchestrator:
                 cpus=self.execution_profile.sandbox_cpus,
                 platform=self.execution_profile.sandbox_platform,
             )
+        self._audit_step(
+            state,
+            target="experiment-runner",
+            structured_output=state.experiment_artifacts.model_dump(),
+        )
         state.stage = PipelineStage.BASELINE_RUN
         return state
 
@@ -639,6 +907,13 @@ class ReproLabOrchestrator:
             passed=report.status in (GateStatus.verified, GateStatus.verified_with_caveats),
             status=report.status,
         )
+        checkpoint_report = self._audit_checkpoint(
+            state,
+            target="gate_2",
+            evidence_bundle=context | {"verification_report": report.model_dump()},
+            trace_text=output,
+        )
+        state.gate_2 = self._apply_checkpoint_report_to_gate(state, checkpoint_report, state.gate_2)
         state.decision_log.append(report.decision_log_entry)
         state.stage = PipelineStage.GATE_2_PASSED
         state.save_checkpoint(self.runs_root)
@@ -672,6 +947,11 @@ class ReproLabOrchestrator:
         state.improvement_hypotheses = [
             ImprovementHypothesis(**h) for h in hypotheses_raw
         ]
+        self._audit_step(
+            state,
+            target="improvement-orchestrator",
+            structured_output={"hypotheses": [hypothesis.model_dump() for hypothesis in state.improvement_hypotheses]},
+        )
         state.stage = PipelineStage.IMPROVEMENTS_SELECTED
 
         # Run each path agent
@@ -691,7 +971,13 @@ class ReproLabOrchestrator:
             )
             try:
                 path_data = self._extract_json(path_output)
-                state.path_results.append(PathResult(**path_data))
+                path_result = PathResult(**path_data)
+                state.path_results.append(path_result)
+                self._audit_step(
+                    state,
+                    target=f"improvement-path:{hypothesis.path_id}",
+                    structured_output=path_result.model_dump(),
+                )
             except (ValueError, Exception) as exc:
                 logger.warning("Path %s failed to parse: %s", hypothesis.path_id, exc)
                 state.path_results.append(
@@ -728,6 +1014,13 @@ class ReproLabOrchestrator:
             passed=report.status in (GateStatus.verified, GateStatus.verified_with_caveats),
             status=report.status,
         )
+        checkpoint_report = self._audit_checkpoint(
+            state,
+            target="gate_3",
+            evidence_bundle=context | {"verification_report": report.model_dump()},
+            trace_text=output,
+        )
+        state.gate_3 = self._apply_checkpoint_report_to_gate(state, checkpoint_report, state.gate_3)
         state.decision_log.append(report.decision_log_entry)
         state.stage = PipelineStage.GATE_3_PASSED
         state.save_checkpoint(self.runs_root)
@@ -756,6 +1049,18 @@ class ReproLabOrchestrator:
             output, fallback_file=str(self._project_dir / "research_map.json"),
         )
         state.research_map = ResearchMap(**data)
+        self._audit_step(
+            state,
+            target="research_map_generated",
+            structured_output=state.research_map.model_dump(),
+        )
+        checkpoint_report = self._audit_checkpoint(
+            state,
+            target="research_map_generated",
+            evidence_bundle=context | {"research_map": state.research_map.model_dump()},
+            trace_text=output,
+        )
+        self._apply_research_map_intervention(state, checkpoint_report)
         state.stage = PipelineStage.RESEARCH_MAP_GENERATED
         # Write final artifacts
         (self._project_dir / "research_map.json").write_text(

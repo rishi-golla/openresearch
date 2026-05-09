@@ -238,8 +238,6 @@ def verify_artifacts(
         evidence_refs=evidence_refs,
         severity="low" if score >= 0.8 else "high",
     )
-
-
 # ---------------------------------------------------------------------------
 # Supervisor: aggregate verifier decisions
 # ---------------------------------------------------------------------------

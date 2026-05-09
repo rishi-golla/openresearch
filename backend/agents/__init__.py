@@ -21,6 +21,7 @@ from backend.agents.schemas import (
     VerificationReport,
 )
 from backend.agents.orchestrator import ReproLabOrchestrator, PipelineState
+from backend.hermes_audit import HermesAuditReport
 
 __all__ = [
     "AGENT_REGISTRY",
@@ -44,4 +45,5 @@ __all__ = [
     "ResearchMap",
     "TrainingRecipe",
     "VerificationReport",
+    "HermesAuditReport",
 ]

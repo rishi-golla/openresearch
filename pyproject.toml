@@ -24,6 +24,9 @@ dependencies = [
 dev = [
     "pytest>=8,<9",
 ]
+hermes = [
+    "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git",
+]
 evals = [
     "deepeval>=2.0",
     "scipy>=1.12",
