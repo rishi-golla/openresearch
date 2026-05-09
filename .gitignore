@@ -42,3 +42,15 @@ Thumbs.db
 # Codex companion local state
 .codex
 .codex/
+
+# Claude Code local state
+.claude/
+
+# Local run outputs
+runs/
+
+# Demo/test artifacts
+demo_paper.pdf
+
+# Windows artifacts
+%APPDATA%/

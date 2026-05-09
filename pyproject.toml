@@ -15,11 +15,17 @@ dependencies = [
     "pydantic-settings>=2.2,<3",
     "httpx>=0.27,<1",
     "pymupdf>=1.24,<2",
+    "claude-agent-sdk>=0.1.80",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8,<9",
+]
+evals = [
+    "deepeval>=2.0",
+    "scipy>=1.12",
+    "numpy>=1.26",
 ]
 
 [tool.setuptools.packages.find]

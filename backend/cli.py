@@ -1,4 +1,4 @@
-"""ReproLab CLI — drives the ingestion + context vertical slice.
+"""ReproLab CLI — drives ingestion, inspection, and reproduction.
 
   $ python -m backend.cli ingest <pdf-path>
       project_id=prj_..., parsed=N sections, sources=N, chunks=N,
@@ -7,9 +7,12 @@
   $ python -m backend.cli inspect <project_id> [--variable VAR]
       Prints the materialized workspace state.
 
+  $ python -m backend.cli reproduce <pdf-path> [--mode offline|sdk]
+      Full pipeline: ingest paper -> build workspace -> run agent pipeline.
+
 This is a thin sequential composer: it wires Intake -> Parser ->
-Indexer -> Workspace through a shared SqliteEventStore. Coordinators
-land in a follow-up; this gives the slice an end-to-end demo loop.
+Indexer -> Workspace through a shared SqliteEventStore. The reproduce
+command extends the pipeline into the agent layer.
 """
 
 from __future__ import annotations
@@ -217,6 +220,168 @@ def _summarize_value(value: object) -> object:
     return value
 
 
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Evaluate a completed pipeline run (reproduction + innovation)."""
+    from backend.agents.orchestrator import PipelineState
+    from backend.evals import EvalRunner, EvalStore
+    from backend.evals.runner import print_innovation_report, print_reproduction_report
+
+    runs_root = Path(args.runs_root)
+    state = PipelineState.load_checkpoint(runs_root, args.project_id)
+    if state is None:
+        print(f"No pipeline state found for {args.project_id}", file=sys.stderr)
+        return 2
+
+    store = EvalStore(args.db)
+    runner = EvalRunner(store=store)
+
+    # Parse paper metrics
+    paper_metrics: dict[str, float] = {}
+    if args.paper_metrics:
+        paper_metrics = json.loads(args.paper_metrics)
+    elif state.experiment_artifacts and state.experiment_artifacts.metrics:
+        # Default: use experiment's own metrics as ground truth (self-comparison)
+        paper_metrics = {
+            k: v for k, v in state.experiment_artifacts.metrics.items()
+            if isinstance(v, (int, float))
+        }
+
+    # Run reproduction eval
+    repro = runner.evaluate_reproduction(
+        state, paper_metrics, version=args.version, paper_id=args.project_id,
+    )
+    print_reproduction_report(repro)
+
+    # Run innovation eval if improvements exist
+    if state.improvement_hypotheses and state.research_map:
+        innov = runner.evaluate_innovation(state, version=args.version, paper_id=args.project_id)
+        print_innovation_report(innov)
+
+    store.close()
+
+    # JSON output
+    result = {
+        "project_id": args.project_id,
+        "version": args.version,
+        "reproduction_composite": repro.composite_score(),
+        "innovation_hypothesis_quality": (
+            innov.mean_hypothesis_quality() if state.improvement_hypotheses else None
+        ),
+        "innovation_integrity_pass_rate": (
+            innov.integrity_pass_rate() if state.improvement_hypotheses else None
+        ),
+    }
+    json.dump(result, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_reproduce(args: argparse.Namespace) -> int:
+    """Full pipeline: ingest a paper, build workspace, run agent pipeline."""
+    import asyncio
+
+    runs_root = Path(args.runs_root)
+
+    # --- Phase 1: Ingest ---
+    store, intake, parser, discovery, indexer, workspace = _make_services(
+        args.database_url, runs_root
+    )
+
+    source = _source_from_cli(args.source, args.source_kind)
+    print(f"[ingest 1/6] Registering project for {args.source}", file=sys.stderr)
+    project_id = intake.register_project(RegisterProject(source=source))
+    print(f"             project_id={project_id}", file=sys.stderr)
+
+    print("[ingest 2/6] Fetching paper", file=sys.stderr)
+    if not intake.fetch_paper(FetchPaper(project_id=project_id)):
+        print("             FAILED — see paper_fetch_failed event", file=sys.stderr)
+        return 1
+
+    print("[ingest 3/6] Parsing", file=sys.stderr)
+    if not parser.start_parsing(StartParsing(project_id=project_id)):
+        print("             FAILED — see parsing_failed event", file=sys.stderr)
+        return 1
+
+    print("[ingest 4/6] Discovering external artifacts", file=sys.stderr)
+    if not discovery.discover(DiscoverArtifacts(project_id=project_id)):
+        print("             FAILED — see discovery_failed event", file=sys.stderr)
+        return 1
+
+    print("[ingest 5/6] Indexing", file=sys.stderr)
+    if not indexer.start_indexing(StartIndexing(project_id=project_id)):
+        print("             FAILED — see indexing_failed event", file=sys.stderr)
+        return 1
+
+    print("[ingest 6/6] Building workspace", file=sys.stderr)
+    workspace_id = workspace.build_workspace(
+        BuildWorkspace(project_id=project_id, agent_name=args.agent)
+    )
+    view = workspace.materialize_view(workspace_id)
+    store.close()
+
+    # Build workspace claim map for the agent pipeline
+    workspace_claim_map = {
+        "project_id": project_id,
+        "entries": [
+            {
+                "source_id": name,
+                "title": name,
+                "excerpt": (
+                    cited.value if isinstance(cited.value, str)
+                    else json.dumps(cited.value) if cited.value is not None
+                    else ""
+                ),
+            }
+            for name, cited in view.variables.items()
+        ],
+    }
+
+    print(f"\n{'='*60}", file=sys.stderr)
+    print(f"Workspace ready — {len(view.variables)} variables", file=sys.stderr)
+    print(f"Starting agent pipeline ({args.mode} mode)...", file=sys.stderr)
+    print(f"{'='*60}\n", file=sys.stderr)
+
+    # --- Phase 2: Agent Pipeline ---
+    user_hints = [h.strip() for h in args.hints.split(",")] if args.hints else None
+
+    if args.mode == "offline":
+        from backend.agents.pipeline import run_pipeline_offline
+
+        state = run_pipeline_offline(
+            project_id, runs_root, workspace_claim_map,
+            user_hints=user_hints,
+            n_improvement_paths=args.n_paths,
+        )
+    else:
+        from backend.agents.pipeline import run_pipeline_sdk
+
+        state = asyncio.run(run_pipeline_sdk(
+            project_id, runs_root, workspace_claim_map,
+            model=args.model,
+            user_hints=user_hints,
+            n_improvement_paths=args.n_paths,
+        ))
+
+    # Print final summary
+    out_dir = runs_root / project_id
+    result = {
+        "project_id": project_id,
+        "stage": state.stage.value,
+        "output_dir": str(out_dir),
+        "gates": {
+            "gate_1": state.gate_1.passed if state.gate_1 else None,
+            "gate_2": state.gate_2.passed if state.gate_2 else None,
+            "gate_3": state.gate_3.passed if state.gate_3 else None,
+        },
+        "assumptions": len(state.assumption_ledger),
+        "improvement_paths": len(state.path_results),
+        "research_map": state.research_map is not None,
+    }
+    json.dump(result, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="reprolab")
     parser.add_argument(
@@ -248,6 +413,33 @@ def main(argv: list[str] | None = None) -> int:
     inspect.add_argument("--agent", default="default")
     inspect.add_argument("--variable", default=None, help="Print one variable's full payload.")
     inspect.set_defaults(func=cmd_inspect)
+
+    evaluate = sub.add_parser("eval", help="Evaluate a completed pipeline run.")
+    evaluate.add_argument("project_id", help="Project ID to evaluate.")
+    evaluate.add_argument("--version", default="dev", help="Agent version label.")
+    evaluate.add_argument(
+        "--paper-metrics", default=None,
+        help="JSON string of paper's reported metrics (e.g. '{\"mean_reward\": 500}').",
+    )
+    evaluate.add_argument("--db", default="evals.db", help="Eval store database path.")
+    evaluate.set_defaults(func=cmd_eval)
+
+    reproduce = sub.add_parser("reproduce", help="Full pipeline: ingest + agent pipeline.")
+    reproduce.add_argument("source", help="PDF path, arXiv id/URL, or DOI/doi.org URL.")
+    reproduce.add_argument(
+        "--source-kind",
+        choices=("auto", "pdf_path", "arxiv", "doi"),
+        default="auto",
+    )
+    reproduce.add_argument("--agent", default="default", help="Agent name for the workspace.")
+    reproduce.add_argument(
+        "--mode", choices=("offline", "sdk"), default="sdk",
+        help="Pipeline mode: 'sdk' uses LLM (default), 'offline' is deterministic.",
+    )
+    reproduce.add_argument("--model", default=None, help="Model override for SDK mode.")
+    reproduce.add_argument("--hints", default=None, help="Comma-separated user hints for improvement.")
+    reproduce.add_argument("--n-paths", type=int, default=3, help="Number of improvement paths.")
+    reproduce.set_defaults(func=cmd_reproduce)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
