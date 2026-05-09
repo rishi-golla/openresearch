@@ -49,8 +49,5 @@ Thumbs.db
 # Local run outputs
 runs/
 
-# Demo/test artifacts
-demo_paper.pdf
-
 # Windows artifacts
 %APPDATA%/
