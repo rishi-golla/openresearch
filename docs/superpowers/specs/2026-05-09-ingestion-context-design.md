@@ -538,7 +538,13 @@ class WorkspaceClosed(DomainEvent):
     reason: str
 ```
 
-**Citation invariant at the event boundary:** every event payload that carries an agent claim has `citations: tuple[Citation, ...]` typed as non-empty (validated by Pydantic). An event constructor with empty citations raises before the event ever reaches the store.
+**Citation invariant — defense in depth.** Three independent layers enforce that no agent claim travels through the system without evidence:
+
+1. **Event payload Pydantic validators** — `VariableLoaded`, `VariableEnriched`, `CitationAttached`, `ToolInvoked` all declare `citations: Annotated[tuple[Citation, ...], Field(min_length=1)]`. Construction with empty citations raises `pydantic.ValidationError` before the event reaches the store.
+2. **EventStore append validation** — the store re-validates payloads via the registered Pydantic model on append. A hand-rolled dict bypassing the constructor still fails here.
+3. **Cited[T] projection construction** — when `WorkspaceProjection` materializes a variable, it builds `Cited[T]` whose `__post_init__` raises `CitationMissingError` on empty citations. Even a hypothetically-malformed event in storage cannot produce a valid in-memory `Cited[T]`.
+
+The only construction path is: `Pydantic event → EventStore append → projection apply → Cited[T]`. Each link enforces the invariant. There is no backdoor.
 
 #### Cited[T] still exists — as a derived view
 
@@ -575,7 +581,18 @@ class Projection(Protocol):
     async def reset(self) -> None: ...
 ```
 
-Every projection persists a checkpoint (last applied `global_position`) so it can resume after restart. Projections rebuild from scratch by `reset()` + replay.
+Every projection persists a checkpoint (last applied `global_position`) so it can resume after restart. Checkpoints live in a dedicated `projection_checkpoints` table:
+
+```sql
+CREATE TABLE projection_checkpoints (
+    projection_name TEXT PRIMARY KEY,
+    last_position INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+```
+
+Projections rebuild from scratch by `reset()` (truncate own state + delete checkpoint row) + replay from `global_position=0`. The checkpoint table also lets ops detect lagging projections (alert when `firehose_position - last_position > N`).
 
 ### 6.2 Concrete projections
 
