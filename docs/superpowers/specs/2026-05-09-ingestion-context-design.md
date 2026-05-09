@@ -1,54 +1,58 @@
-# Ingestion + Context Layer — Event-Sourced Design Spec
+# Ingestion + Context Layer — Event-Sourced Design Spec (Revision 2)
 
 | Field | Value |
 |---|---|
 | Date | 2026-05-09 |
 | Owner | lolout1 |
-| Status | Approved for implementation |
+| Status | Approved for implementation (post-Codex review) |
 | Issues | #3 (umbrella), #4 (umbrella), #12, #13, #14, #15, #16 |
 | Cross-team deps (slot-in) | #8 (canonical schemas, rishi-golla), #9 (SQLite repository, rishi-golla) |
-| Architectural approach | **Event Sourcing + CQRS** (Approach C — full audit-grade, no cuts) |
+| Architectural approach | **Event Sourcing + CQRS** with durable inbox/outbox coordinators |
+| Revision history | r1 2026-05-09: initial event-sourced design. r2 2026-05-09: incorporates Codex principal-engineer review (aggregate purity, durable inbox/outbox, capture completeness, security hardening, ID composition, scope policy, acceptance semantics). |
 
 ## 1. Why event sourcing for this system
 
-ReproLab's entire product thesis is **auditability**: every claim, every decision, every reproduction step must be traceable. Event sourcing isn't a stylistic choice here — it's the *natural* representation of the domain:
+ReproLab's product thesis is **auditability**: every claim, every decision, every reproduction step must be traceable. Event sourcing is the natural representation of that domain.
 
 | Domain need | Event sourcing answer |
 |---|---|
 | "What did the agent know at decision time?" | Replay events up to that point. |
 | "Why did the verifier reject this?" | The rejection event is a first-class fact in the log. |
-| "Reproduce the run from scratch on a different machine" | Replay the event stream. |
+| "Reproduce the run on a different machine" | Replay the captured event stream — including LLM/embedding/HTTP responses. |
 | "Show provenance for this citation" | Walk back along `causation_id` to the originating event. |
-| "Add a new dashboard view of agent activity" | Add a new projection; rebuild from existing events. |
-| "Detect a verification disagreement" | A process manager listens for divergent verifier events. |
+| "Add a new dashboard view" | Add a projection; rebuild from the existing event log. |
+| "Detect a verifier disagreement" | A coordinator listens for divergent verifier events. |
 
-Approach A (Protocol-bounded services) gives you swappability but the *truth* is held in mutable service state — you reconstruct history by reading logs after the fact. Event sourcing inverts this: the event log **is** the truth; service state is a derived projection. For ReproLab specifically, this is the difference between "we kept good logs" and "the log is the system."
+Approach A (Protocol-bounded services) gives swappability but truth lives in mutable service state. Approach B couples too tightly. **Event sourcing inverts: the event log *is* the truth; service state is a derived projection.** That is the architectural keystone.
 
 ## 2. Goals, Non-Goals, Constraints
 
 ### Goals
 1. **Single source of truth** — the event store is canonical; all state derives from it.
-2. **Replay-as-debugging** — any past run can be replayed exactly (modulo external API changes, which we record into the log via captured-response events).
-3. **Time travel** — answer "what did agent X believe at time T" by replaying events for project P up to T.
-4. **Multiple consumers, zero coupling** — dashboard, verifiers, supervisors, future analytics all read the same events through projections of their own.
-5. **Schema evolution without rewrites** — every event has a `schema_version`; upcasters migrate old payloads forward at read time.
-6. **Citation invariant enforced at the event boundary** — events that carry agent claims cannot be constructed without `citations: tuple[Citation, ...]` populated.
-7. **No data loss on failure** — every command attempt produces an event (success or failure). Crashes mid-process are recoverable.
-8. **Production observability** — structured logs, OpenTelemetry traces with `correlation_id` and `causation_id` chains, Prometheus metrics.
-9. **`mypy --strict`** clean across the stack.
+2. **Replay-as-debugging** — any past run can be replayed deterministically (HTTP, LLM, embeddings, web search, NotebookLM, Chroma queries — *all* captured).
+3. **Time travel** — answer "what did agent X believe at time T" by replaying for project P up to T.
+4. **Multiple consumers, zero coupling** — dashboard, verifiers, supervisors, future analytics each read their own projections of the same event log.
+5. **Schema evolution without rewrites** — every event has `schema_version`; an upcaster registry migrates payloads forward at read time, including snapshots.
+6. **Citation invariant defended in depth** — Pydantic validation, store-side re-validation, and `Cited[T]` materialization each enforce non-emptiness independently.
+7. **No data loss on failure** — every command attempt produces an event (success or failure). Crashes mid-flow are recoverable through durable inbox/outbox tables, not just trace metadata.
+8. **Aggregate purity** — aggregates validate state transitions only. IO is the responsibility of application services and adapters that append events afterward.
+9. **Production observability** — structured logs, OpenTelemetry traces with `correlation_id` and `causation_id` chains, Prometheus metrics including outbox/dead-letter/capture metrics.
+10. **Security at the data ingress** — PDF parsing isolated; embedding/parser model digests pinned; captured headers redacted; no implicit network-fetched code.
+11. **`mypy --strict`** clean across the stack.
 
 ### Non-Goals
 - Building the agent runtime (Docker sandbox / RuntimeBackend) — separate umbrella.
 - Building the agent orchestrator + spawn policy — separate umbrella.
-- Verifier team and improvement agents — they consume events from this layer, but live elsewhere.
-- Frontend rendering — it subscribes to the event store, but rendering is its own spec.
-- Six REPL tools beyond `lookup` and `semantic_search` — they plug in via the same `WorkspaceTool` Protocol but ship later.
+- Verifier team and improvement agents — they consume events from this layer; their internals live elsewhere.
+- Frontend rendering — subscribes to projections and event firehose; not built here.
+- Six REPL tools beyond `lookup` and `semantic_search` — Protocol slots ready (`graph_query`, `web_search`, `notebook_query`, `rlm_query`); implementations land later.
+- Knowledge graph (Graphify) — Phase 2 per PRD.
 
 ### Constraints
 - Python 3.11+, `mypy --strict`.
-- All HTTP through `httpx` with retries + rate limiting + circuit breakers.
-- All external API responses *captured* as events (so replays are deterministic even if upstream changes).
-- Event store starts as embedded SQLite (WAL mode) — handles tens of millions of events comfortably; can graduate to EventStoreDB or Postgres later via the same Protocol.
+- All HTTP through `shared/http.py` with retries + rate limiting + circuit breakers + **synchronous capture into the event log**.
+- All non-deterministic external surfaces (HTTP, LLM, embeddings, web search, NotebookLM, Chroma) flow through capture-aware client wrappers; all responses recorded for deterministic replay.
+- Event store starts as embedded SQLite (WAL mode); explicit migration triggers (§4.5) move it to EventStoreDB or Postgres when those triggers fire.
 - Long timeline → no hackathon-driven cuts.
 
 ## 3. Architectural Overview
@@ -62,145 +66,239 @@ Approach A (Protocol-bounded services) gives you swappability but the *truth* is
                            │   by aggregate_id)            │
                            └───────────────────────────────┘
                                   ▲              │
-                                  │ events       │ subscribe / replay
+                                  │ append       │ subscribe / replay
                                   │              ▼
-   ┌──────────┐    cmd     ┌────────────┐    ┌─────────────────┐    read     ┌──────────┐
-   │  Caller  │──────────► │ Aggregate  │    │   Projections   │ ◄─────────  │ Readers  │
-   │ (CLI/API)│            │  (write    │    │  (read models)  │             │(agents,  │
-   └──────────┘            │   side)    │    └─────────────────┘             │ dashboard│
-                           └────────────┘            ▲                       │ verifiers│
-                                                     │                       └──────────┘
-                                  ┌──────────────────┴─────────────────────┐
-                                  │            Process Managers            │
-                                  │  (event-driven workflow coordinators)  │
-                                  └────────────────────────────────────────┘
+   ┌──────────┐    cmd     ┌────────────────┐  ┌─────────────────┐    read     ┌──────────┐
+   │  Caller  │──────────► │ Application    │  │   Projections   │ ◄─────────  │ Readers  │
+   │ (CLI/API)│            │ Service +      │  └─────────────────┘             │(agents,  │
+   └──────────┘            │ Aggregate      │           ▲                      │ dashboard│
+                           │ (write side)   │           │                      │ verifiers│
+                           └────────────────┘           │                      └──────────┘
+                                  ▲                     │
+                                  │                     │
+                           ┌──────┴─────────────────────┴─────────┐
+                           │   Coordinators (durable inbox +      │
+                           │   transactional outbox)              │
+                           └──────────────────────────────────────┘
 ```
 
-- **Commands** carry intent (e.g., `CreateProject`, `StartParsing`, `BuildWorkspace`).
-- **Aggregates** apply commands → emit events.
-- **Events** are facts; immutable; appended to the event store.
-- **Projections** subscribe to events → maintain read models (indexed for query).
-- **Process managers** coordinate workflows by reacting to events and issuing new commands.
-- **Readers** (agents, dashboard, verifiers) consume projections; never read aggregates directly.
+- **Commands** carry intent (e.g., `CreateProject`, `RequestParse`, `RequestDiscoveryAdapter`).
+- **Application services** orchestrate IO (HTTP fetches, parser invocations) and append result events.
+- **Aggregates** validate state transitions and emit transition events. They do not call IO.
+- **Events** are facts; immutable; appended.
+- **Projections** subscribe to events and maintain read models.
+- **Coordinators** are deterministic workflow drivers with a durable inbox (handled events) + transactional outbox (commands to dispatch). Most coordinators are not themselves event-sourced; that complexity is reserved for workflows with user-visible decisions.
+- **Readers** consume projections, never aggregates.
 
-### 3.2 Aggregates in this layer
+### 3.2 Aggregates
 
-| Aggregate | aggregate_type | Lifecycle | Owns |
+| Aggregate | aggregate_type | Lifecycle states (validates only — no IO) | Owns |
 |---|---|---|---|
-| `Project` | `project` | Creation → metadata complete → archived | Source identity, paper PDF reference, paper metadata |
-| `ParsedPaper` | `parsed_paper` | Parse start → complete (or failed) | Parser identity, sections, references, figures, full text |
-| `Discovery` | `discovery` | Start → adapters report → complete | Discovered artifacts per adapter |
-| `Index` | `index` | Start → sources/chunks registered → complete | SourceRefs and Chunks for the project |
-| `Workspace` | `workspace` | Created → variables loaded → tool calls → ready/closed | Per-agent variable bindings, tool call history |
+| `Project` | `project` | NEW → REGISTERED → METADATA_KNOWN → ARCHIVED | Source identity, paper PDF reference, paper metadata |
+| `ParsedPaper` | `parsed_paper` | PENDING → PARSING → PARSED \| FAILED | Parser identity (name+version), sections, references, figures |
+| `Discovery` | `discovery` | PENDING → IN_PROGRESS → COMPLETED \| FAILED | Per-adapter outcomes |
+| `Index` | `index` | PENDING → INDEXING → INDEXED \| FAILED | SourceRefs, Chunks, embedding job state |
+| `Workspace` | `workspace` | CREATED → LOADING → READY → CLOSED | Per-agent variable bindings, tool call history, scope assignments |
 
-Each aggregate has a content-hashed or ULID-based `aggregate_id`.
+Each aggregate has a content-hashed or ULID-based `aggregate_id` and is loaded by replaying its own event stream (with optional snapshot acceleration).
 
-### 3.3 Projections (read models)
+### 3.3 Application services (the IO boundary)
+
+Application services are thin orchestrators that:
+1. Receive a command.
+2. Optionally load aggregates (for state validation).
+3. Perform IO (HTTP, parser, embedder, etc.).
+4. Append the resulting events to the store.
+
+```python
+class IntakeAppService:
+    def __init__(self, store: EventStore, fetchers: Mapping[str, IntakeFetcher], clock: Clock) -> None: ...
+
+    async def handle_register_project(self, cmd: RegisterProject) -> ProjectId:
+        # Aggregate validates command shape + uniqueness.
+        agg = await self._load_or_init(ProjectId.from_source(cmd.source))
+        events = agg.handle_register(cmd)             # state-transition only
+        await self.store.append(agg.id, "project", events, expected_version=agg.version)
+        return agg.id
+
+    async def handle_fetch_paper(self, cmd: FetchPaper) -> None:
+        agg = await self._load(cmd.project_id)
+        agg.guard_can_fetch()                          # validates state, no IO
+        fetcher = self.fetchers[cmd.source.kind]
+        try:
+            mat = await fetcher.fetch(cmd.source)      # IO happens here
+            await self.store.append(agg.id, "project", [PaperFetched(...)], expected_version=agg.version)
+        except FetchError as e:
+            await self.store.append(agg.id, "project", [PaperFetchFailed(...)], expected_version=agg.version)
+```
+
+This pattern is repeated for parser invocation, discovery adapter calls, indexing, and workspace builds.
+
+### 3.4 Projections (read models)
 
 | Projection | Subscribes to | Materializes |
 |---|---|---|
-| `ProjectsProjection` | `Project*` events | Current project list, status, metadata |
-| `ParsedPapersProjection` | `ParsedPaper*` | Latest parsed view per project, section index |
-| `ArtifactsProjection` | `Discovery*` | Discovered artifacts per project, by kind |
-| `SourcesProjection` | `Index*` | SourceRef + Chunk lookup tables |
-| `SemanticIndexProjection` | `Index*` | Chroma embedding index keyed by ChunkId |
-| `WorkspaceProjection` | `Workspace*` | Per-workspace variables, tool history |
-| `CitationGraphProjection` | `Workspace*`, `Verification*` | Edges from claims → evidence chunks |
-| `EventTimelineProjection` | * (firehose) | Per-project event timeline for the dashboard |
+| `ProjectsProjection` | `project` events | Project list, status, metadata |
+| `ParsedPapersProjection` | `parsed_paper` events | Sections, references, figures, full text |
+| `ArtifactsProjection` | `discovery` events | Discovered artifacts per project, by kind, with trust |
+| `SourcesProjection` | `index` events | SourceRef and Chunk lookup tables |
+| `SemanticIndexProjection` | `index` events | Chroma collection per project (built from stored embedding blobs, never by re-embedding on rebuild) |
+| `WorkspaceProjection` | `workspace` events | Per-workspace, per-scope variable bindings (`Cited[T]`) |
+| `CitationGraphProjection` | `workspace`, `verification` events | Edges from claim → evidence chunks |
+| `EventTimelineProjection` | * (firehose) | Per-project timeline for dashboard replay |
+| `OutboxBacklogProjection` | coordinator inbox/outbox tables (not event-sourced) | Operational health view |
 
-Projections are *eventually consistent*. A projection can be torn down and rebuilt from the event log at any time — this is the testing and migration superpower of event sourcing.
+Projections are eventually consistent. Each projection persists a checkpoint (last applied `global_position`) and supports `reset()` + replay-from-zero rebuild. **`SemanticIndexProjection` rebuild is special-cased**: it never re-embeds; it loads embedding vectors from stored blobs (referenced in `ChunkEmbedded` events). Re-embedding is opt-in via an explicit `ReindexEmbeddings` command and produces new `ChunkEmbedded` events with a new `embedding_model` field.
 
-### 3.4 Process managers
+### 3.5 Coordinators (durable inbox + transactional outbox)
 
-| Process manager | Reacts to | Issues commands |
-|---|---|---|
-| `IngestionFlow` | `ProjectCreated` | `StartParsing`, `StartDiscovery` |
-| `IndexingFlow` | `ParsingCompleted` + `DiscoveryCompleted` (joined) | `StartIndexing` |
-| `WorkspaceReadyFlow` | `IndexingCompleted` | `BuildWorkspace(agent_name)` (per agent) |
-| `RetryFlow` | `*Failed` events with `retryable=True` | Re-issue original command with backoff |
-| `CapturedResponseFlow` | All `ExternalApiCalled` | Persist captured responses to enable deterministic replay |
+**Most coordinators are not event-sourced.** They use:
 
-Process managers hold their own state, also event-sourced (their state is itself an aggregate). This means a crashed process manager wakes up, replays its history, and resumes mid-workflow.
+```sql
+CREATE TABLE coordinator_inbox (
+    coordinator_name TEXT NOT NULL,
+    handled_event_id TEXT NOT NULL,            -- idempotent ack
+    handled_at TEXT NOT NULL,
+    PRIMARY KEY (coordinator_name, handled_event_id)
+);
 
-### 3.5 Module layout
+CREATE TABLE coordinator_state (
+    coordinator_name TEXT NOT NULL,
+    aggregate_key TEXT NOT NULL,               -- e.g. project_id when joining parsing+discovery
+    state_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (coordinator_name, aggregate_key)
+);
+
+CREATE TABLE coordinator_outbox (
+    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    coordinator_name TEXT NOT NULL,
+    command_type TEXT NOT NULL,
+    command_payload TEXT NOT NULL,
+    causation_event_id TEXT,
+    correlation_id TEXT NOT NULL,
+    enqueued_at TEXT NOT NULL,
+    dispatched_at TEXT,                        -- NULL until dispatcher acks
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+```
+
+A single transaction handles: insert into `coordinator_inbox` (idempotent ack), update `coordinator_state`, insert into `coordinator_outbox`. A separate dispatcher loop drains `coordinator_outbox` to the command bus with retry + dead-letter.
+
+This gives **at-least-once** processing with **idempotent at-most-once** effects (downstream commands carry their own command_id; the idempotency table in §4.6 prevents duplicate handling).
+
+Coordinators in scope:
+
+| Coordinator | Reacts to | Issues commands | State |
+|---|---|---|---|
+| `IngestionCoordinator` | `ProjectCreated` | `FetchPaper`, `StartDiscovery` | None (stateless join) |
+| `IndexingCoordinator` | `ParsingCompleted`, `DiscoveryCompleted` | `StartIndexing` once both arrive | `{project_id: {parsed: bool, discovered: bool}}` |
+| `WorkspaceReadyCoordinator` | `IndexingCompleted`, `AgentRegistered` (from #10) | `BuildWorkspace` per registered agent | None (subscribes to AgentRegistry events owned by #10) |
+| `RetryCoordinator` | `*Failed` with `retryable=True` | re-issues original command with backoff | `{causation_chain_id: {attempts: int, next_at: ts}}` |
+| `EmbeddingCoordinator` | `ChunkCreated` | `EmbedChunk` (rate-limited via outbox) | `{project_id: {queued: int, in_flight: int}}` |
+
+**Event-sourced coordinator state is reserved** for workflows with user-visible decisions, approvals, or long-running negotiations. None in this spec yet. The AgentRegistry that `WorkspaceReadyCoordinator` consults is **owned by #10/#2** (the orchestrator team) — we subscribe to their `AgentRegistered`/`AgentDeregistered` events; we do not implement the registry.
+
+### 3.6 Module layout
 
 ```
 openresearch/
 ├── eventstore/                          # The bedrock
-│   ├── interface.py                     # EventStore Protocol
+│   ├── interface.py                     # EventStore + Subscription + StoreCapabilities Protocols
 │   ├── sqlite_store.py                  # SQLite + WAL implementation
-│   ├── jsonl_store.py                   # JSONL implementation (debug, ops)
-│   ├── snapshot.py                      # Snapshot Protocol + storage
-│   ├── upcaster.py                      # Schema-version upcasters
-│   ├── subscription.py                  # Long-lived subscription primitive
-│   └── replay.py                        # Bulk replay engine
+│   ├── jsonl_store.py                   # JSONL implementation (debug, ops dump)
+│   ├── snapshot.py                      # Snapshot Protocol + integrity envelope
+│   ├── upcaster.py                      # Upcaster Protocol + registry + golden fixture support
+│   ├── subscription.py                  # Persistent subscription with ack/nack/lease
+│   └── replay.py                        # Bulk replay + determinism harness
 ├── messaging/
-│   ├── command.py                       # Command base + dispatcher
-│   ├── event.py                         # Event base + envelope (correlation/causation IDs)
-│   └── bus.py                           # In-proc bus + NATS adapter (slot-in)
-├── ingestion/                           # Umbrella #3
+│   ├── command.py                       # Command base + CommandDispatcher
+│   ├── event.py                         # DomainEvent base + StoredEvent + EventEnvelope
+│   ├── idempotency.py                   # Bounded (aggregate_id, command_id) -> result_event_ids table
+│   └── bus.py                           # InProcMessageBus, NatsMessageBus (slot-in)
+├── coordinators/                        # Durable inbox/outbox coordinators
+│   ├── runtime.py                       # CoordinatorRuntime: inbox dedupe + state + outbox dispatch
+│   ├── ingestion_coordinator.py
+│   ├── indexing_coordinator.py
+│   ├── workspace_ready_coordinator.py
+│   ├── retry_coordinator.py
+│   └── embedding_coordinator.py
+├── ingestion/
 │   ├── intake/                          # Issue #12
-│   │   ├── commands.py                  # CreateProject command + handler
-│   │   ├── events.py                    # ProjectCreated, PaperFetched, MetadataExtracted, ...
-│   │   ├── aggregate.py                 # ProjectAggregate
-│   │   ├── adapters/                    # PDF, arXiv, DOI fetch adapters
+│   │   ├── commands.py                  # RegisterProject, FetchPaper, ExtractMetadata
+│   │   ├── events.py                    # ProjectCreated, PaperFetched, MetadataExtracted, *Failed
+│   │   ├── aggregate.py                 # ProjectAggregate (validates only)
+│   │   ├── service.py                   # IntakeAppService (IO + append)
+│   │   ├── fetchers/                    # PdfPathFetcher, ArxivFetcher, DoiFetcher
 │   │   └── projections.py               # ProjectsProjection
 │   ├── parser/                          # Issue #13
 │   │   ├── commands.py                  # StartParsing
-│   │   ├── events.py                    # ParsingStarted, SectionExtracted, ReferenceExtracted, ParsingCompleted, ParsingFailed
+│   │   ├── events.py                    # ParsingStarted, SectionExtracted, EquationExtracted, ReferenceExtracted, FigureExtracted, TableExtracted, ParsingCompleted, ParsingFailed
 │   │   ├── aggregate.py                 # ParsedPaperAggregate
+│   │   ├── service.py                   # ParserAppService (runs parser worker → appends events)
+│   │   ├── workers/                     # parser process isolation: pymupdf_worker.py, nougat_worker.py
 │   │   ├── pymupdf_parser.py
 │   │   ├── nougat_parser.py
 │   │   └── projections.py               # ParsedPapersProjection
 │   └── discovery/                       # Issue #14
-│       ├── commands.py                  # StartDiscovery
-│       ├── events.py                    # DiscoveryStarted, ArtifactFound, AdapterFailed, DiscoveryCompleted
+│       ├── commands.py                  # StartDiscovery, RunDiscoveryAdapter
+│       ├── events.py                    # DiscoveryStarted, AdapterStarted, ArtifactFound, AdapterFailed, AdapterCompleted, DiscoveryCompleted
 │       ├── aggregate.py                 # DiscoveryAggregate
-│       ├── adapters/                    # GitHub, PWC, HF, Semantic Scholar
+│       ├── service.py                   # DiscoveryAppService
+│       ├── adapters/                    # github, papers_with_code, huggingface, semantic_scholar
+│       ├── trust.py                     # ArtifactTrust scoring (official/recommended/community)
 │       └── projections.py               # ArtifactsProjection
-├── context/                             # Umbrella #4
+├── context/
 │   ├── indexer/                         # Issue #15
-│   │   ├── commands.py                  # StartIndexing
-│   │   ├── events.py                    # SourceRegistered, ChunkCreated, IndexingCompleted, IndexingFailed
+│   │   ├── commands.py                  # StartIndexing, EmbedChunk, ReindexEmbeddings
+│   │   ├── events.py                    # IndexingStarted, SourceRegistered, ChunkCreated, EmbeddingQueued, EmbeddingStarted, ChunkEmbedded, EmbeddingFailed, IndexingCompleted, IndexingFailed
 │   │   ├── aggregate.py                 # IndexAggregate
+│   │   ├── service.py                   # IndexerAppService
 │   │   ├── chunkers/
+│   │   ├── embedder.py                  # EmbedderClient with capture
 │   │   └── projections.py               # SourcesProjection, SemanticIndexProjection
 │   └── workspace/                       # Issue #16
-│       ├── commands.py                  # BuildWorkspace, AttachCitation, CallTool, EnrichVariable
-│       ├── events.py                    # WorkspaceCreated, VariableLoaded, VariableEnriched, CitationAttached, ToolInvoked, WorkspaceReady, WorkspaceClosed
+│       ├── commands.py                  # BuildWorkspace, LoadVariable, EnrichVariable, AttachCitation, CallTool, PromoteVariable, CloseWorkspace
+│       ├── events.py                    # WorkspaceCreated, VariableLoaded, VariableEnriched, VariablePromoted, CitationAttached, ToolInvoked, WorkspaceReady, WorkspaceClosed
 │       ├── aggregate.py                 # WorkspaceAggregate
-│       ├── model.py                     # Cited[T], Citation, Provenance
-│       ├── tools/
+│       ├── service.py                   # WorkspaceAppService
+│       ├── model.py                     # Cited[T], Citation, NonEmptyCitations, Provenance, Scope
+│       ├── tools/                       # interface, lookup, semantic_search (others slot-in)
 │       └── projections.py               # WorkspaceProjection, CitationGraphProjection
-├── flows/
-│   ├── ingestion_flow.py
-│   ├── indexing_flow.py
-│   ├── workspace_ready_flow.py
-│   ├── retry_flow.py
-│   └── captured_response_flow.py
+├── capture/                             # Synchronous external-call capture
+│   ├── http_client.py                   # CapturingHttpClient (httpx wrapper)
+│   ├── llm_client.py                    # CapturingLlmClient (Anthropic SDK wrapper)
+│   ├── embedding_client.py              # CapturingEmbeddingClient
+│   ├── chroma_client.py                 # CapturingChromaClient
+│   ├── web_search_client.py             # CapturingWebSearchClient
+│   ├── notebook_lm_client.py            # CapturingNotebookLmClient
+│   ├── blob_store.py                    # Atomic blob write + GC + encryption
+│   └── replay_mode.py                   # ReplayInterceptor: short-circuits to captured responses
 └── shared/
-    ├── ids.py
-    ├── envelope.py                      # event envelope: correlation_id, causation_id, occurred_at, schema_version
-    ├── errors.py
-    ├── http.py                          # httpx + rate limit + circuit breaker
-    ├── observability.py                 # structlog + OpenTelemetry
+    ├── ids.py                           # Composed content-addressed IDs
+    ├── envelope.py                      # EventEnvelope with correlation/causation/source/schema_version
+    ├── errors.py                        # OpenResearchError hierarchy
+    ├── observability.py                 # structlog + OpenTelemetry helpers
+    ├── security.py                      # HeaderRedactor, SecretEncryptor, ModelDigestVerifier
     └── config.py                        # pydantic-settings
 ```
 
 ## 4. The Event Store
 
-### 4.1 Protocol
+### 4.1 Protocols
 
 ```python
 class EventStore(Protocol):
+    @property
+    def capabilities(self) -> StoreCapabilities: ...
+
     async def append(
         self,
         aggregate_id: AggregateId,
         aggregate_type: str,
         events: Sequence[DomainEvent],
-        expected_version: int | None = None,   # optimistic concurrency
-        correlation_id: CorrelationId | None = None,
-        causation_id: EventId | None = None,
+        expected_version: int,
+        envelope: EventEnvelope,
     ) -> AppendResult: ...
 
     async def load(
@@ -212,71 +310,207 @@ class EventStore(Protocol):
     async def load_global(
         self,
         from_position: int = 0,
+        to_position: int | None = None,
         types: Iterable[str] | None = None,
+        batch_size: int = 1000,
     ) -> AsyncIterator[StoredEvent]: ...
 
     async def subscribe(
         self,
-        from_position: int = 0,
+        subscription_name: str,
         types: Iterable[str] | None = None,
-    ) -> AsyncIterator[StoredEvent]: ...
+    ) -> Subscription: ...
 
     async def get_aggregate_version(self, aggregate_id: AggregateId) -> int: ...
+
+
+class Subscription(Protocol):
+    """Persistent subscription with checkpoint, ack/nack, and lease."""
+    @property
+    def name(self) -> str: ...
+    @property
+    def position(self) -> int: ...
+
+    async def __aiter__(self) -> AsyncIterator[StoredEvent]: ...
+    async def ack(self, event: StoredEvent) -> None: ...        # advances checkpoint
+    async def nack(self, event: StoredEvent, *, retry_after_seconds: float) -> None: ...
+    async def renew_lease(self) -> None: ...                   # for long-running handlers
+    async def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class StoreCapabilities:
+    supports_persistent_subscriptions: bool
+    supports_stream_categories: bool
+    max_event_payload_bytes: int
+    optimistic_concurrency: bool
+    supports_transactional_outbox: bool
+
+
+class AppendError(Exception): ...
+class ConcurrencyError(AppendError):
+    """Raised when expected_version != current_version. Carries actual_version."""
+    actual_version: int
+class DuplicateEventError(AppendError): ...
 ```
 
-### 4.2 SQLite-backed implementation (production default)
-
-Schema:
+### 4.2 SQLite-backed implementation (default)
 
 ```sql
 CREATE TABLE events (
     global_position INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id TEXT NOT NULL UNIQUE,                -- ULID, idempotency
+    event_id TEXT NOT NULL UNIQUE,
     aggregate_id TEXT NOT NULL,
     aggregate_type TEXT NOT NULL,
-    aggregate_version INTEGER NOT NULL,            -- per-aggregate sequence
+    aggregate_version INTEGER NOT NULL,
     event_type TEXT NOT NULL,
     schema_version INTEGER NOT NULL,
-    payload_json TEXT NOT NULL,                    -- the serialized event
-    metadata_json TEXT NOT NULL,                   -- envelope: correlation/causation/occurred_at/source
-    occurred_at TEXT NOT NULL,                     -- ISO8601 UTC
-    UNIQUE (aggregate_id, aggregate_version)       -- enforces optimistic concurrency
+    payload_json TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,           -- envelope: correlation, causation, source, occurred_at
+    occurred_at TEXT NOT NULL,
+    UNIQUE (aggregate_id, aggregate_version)
+);
+CREATE INDEX idx_events_aggregate     ON events(aggregate_id, aggregate_version);
+CREATE INDEX idx_events_type          ON events(event_type);
+CREATE INDEX idx_events_occurred_at   ON events(occurred_at);
+
+CREATE TABLE subscription_checkpoints (
+    subscription_name TEXT PRIMARY KEY,
+    last_position INTEGER NOT NULL,
+    leased_by TEXT,                        -- worker id holding the lease
+    lease_expires_at TEXT,
+    last_ack_at TEXT NOT NULL
 );
 
-CREATE INDEX idx_events_aggregate ON events(aggregate_id, aggregate_version);
-CREATE INDEX idx_events_type ON events(event_type);
-CREATE INDEX idx_events_occurred_at ON events(occurred_at);
+CREATE TABLE projection_checkpoints (
+    projection_name TEXT PRIMARY KEY,
+    last_position INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
 ```
 
-**Why SQLite:**
-- Embedded, zero ops overhead.
-- WAL mode + `synchronous=NORMAL` → ~10K writes/sec on commodity hardware.
-- Single-writer model fits CQRS naturally (commands serialized through one writer per aggregate).
-- One file per environment; trivial to copy, replay, version.
-- Migrates cleanly to Postgres or EventStoreDB later through the same Protocol.
+PRAGMAs at startup: `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`.
 
-### 4.3 Snapshots
+**Realistic throughput.** Under mixed load (event append + projection update + Chroma write + blob fsync), expect **hundreds to low-thousands of durable appends/sec on developer hardware**, not 10K. 10K is an isolated-write SQLite microbenchmark; ReproLab's load is far from isolated.
 
-For aggregates that grow large (e.g., a `Workspace` with hundreds of `VariableEnriched` events), periodic snapshots keep replay cheap:
+### 4.3 Migration triggers (when to leave SQLite)
+
+Move to EventStoreDB or Postgres when **any** of:
+1. More than one project ingests concurrently and queue depth grows.
+2. Phase 3 remote runners arrive (PRD §2482-2496).
+3. Phase 4 multi-user projects arrive (PRD §2504-2507).
+4. Projection lag is user-visible (>5s steady state).
+5. Need durable fan-out / backpressure across machine boundaries.
+6. Any append latency p99 exceeds 100ms.
+
+EventStoreDB is preferred when aggregate stream consistency and persistent subscriptions matter most. Postgres is preferred when SQL operability and shared transactional outbox matter most. NATS JetStream is a fan-out bus, not a canonical store — pair it with a database.
+
+### 4.4 Snapshot integrity
 
 ```python
 @dataclass(frozen=True)
-class Snapshot:
+class SnapshotEnvelope:
     aggregate_id: AggregateId
     aggregate_type: str
     aggregate_version: int
+    global_position: int                   # last event included
     payload_json: str
-    schema_version: int
+    payload_schema_version: int
+    included_event_ids_hash: str           # sha256 of sorted included event_ids
+    upcaster_chain_versions: tuple[int, ...]   # upcaster versions applied to construct payload
     taken_at: datetime
-
-class SnapshotStore(Protocol):
-    async def put(self, snapshot: Snapshot) -> None: ...
-    async def get_latest(self, aggregate_id: AggregateId) -> Snapshot | None: ...
 ```
 
-Policy: snapshot every 50 events for `Workspace`; every 200 for `Index`. Snapshots are themselves event-sourced (they're a derived projection over the canonical event log) — they're a cache, never canonical.
+On replay, the loader verifies:
+1. `payload_schema_version` is supported (or upcasted to current).
+2. `included_event_ids_hash` matches recomputed hash from store events 0…aggregate_version.
+3. `upcaster_chain_versions` matches the registered chain.
 
-### 4.4 Upcasters
+A snapshot that fails any check is discarded and replay starts from event 0.
+
+**Snapshot policy is measurement-driven, not fixed.** No "every 50 events" rule. The runtime tracks aggregate replay duration per aggregate_type; when replay exceeds 100ms on average, the snapshot scheduler kicks in for that type. Initial threshold tunable via config; revisit when metrics arrive.
+
+### 4.5 Captured external interactions
+
+Every external surface that introduces non-determinism is captured. Not just HTTP.
+
+```python
+class ExternalInteractionAttempted(DomainEvent):
+    """Pre-call event so we know the call started even if the process crashes mid-call."""
+    schema_version = 1
+    interaction_id: InteractionId          # ULID
+    surface: str                           # "http" | "llm" | "embedding" | "chroma" | "web_search" | "notebook_lm"
+    request_summary: str                   # human-readable (e.g. "GET arxiv.org/...")
+    request_fingerprint: str               # sha256 of (method, url, normalized body, surface-specific key)
+    cache_key: str                         # for replay deduplication
+    attempt: int                           # 1, 2, 3, ... for retries
+
+class ExternalApiCalled(DomainEvent):
+    schema_version = 1
+    interaction_id: InteractionId
+    surface: str
+    request_method: str | None             # null for non-HTTP surfaces
+    request_url: str | None
+    request_headers_redacted_json: str     # bearer tokens, cookies stripped or encrypted-blob refs
+    request_body_sha256: str | None
+    request_body_blob_path: str | None     # if body > 4KB, stored as blob
+    response_status: int | None
+    response_headers_json: str
+    response_body_sha256: str
+    response_body_blob_path: str
+    redirect_chain: tuple[str, ...]
+    duration_ms: int
+
+class ExternalApiFailed(DomainEvent):
+    schema_version = 1
+    interaction_id: InteractionId
+    surface: str
+    error_kind: str                        # "timeout" | "connection_reset" | "ssl_error" | "rate_limited" | "server_error" | "client_error"
+    error_message: str                     # truncated to 1KB
+    duration_ms: int
+    will_retry: bool
+```
+
+`*Attempted` is appended **before** the call leaves the process. `*Called` or `*Failed` is appended **after**. If the process dies between them, replay sees the attempt with no resolution and the retry coordinator can re-issue.
+
+**Captured surfaces:**
+
+| Surface | Wrapper | Captured fields | Notes |
+|---|---|---|---|
+| HTTP (httpx) | `CapturingHttpClient` | method, url, headers (redacted), body sha + blob, status, response headers, redirect chain, body sha + blob, duration | Generic |
+| Anthropic LLM | `CapturingLlmClient` | model name, model digest hint, prompt sha, prompt blob, system blob, tools fingerprint, response sha + blob, usage tokens | `model_digest_hint` is the first 12 chars of a digest published by Anthropic per model release; allows replay-time mismatch detection |
+| Embeddings | `CapturingEmbeddingClient` | model name, model package + weight digest, input batch sha, output vectors blob, duration | Pinned model digests (§8.10) |
+| Chroma queries | `CapturingChromaClient` | collection, query embedding sha, top-k, returned chunk_ids, distances, duration | Captures the query result, not the index |
+| Web search | `CapturingWebSearchClient` | query, provider, top results URLs, snippets blob | |
+| NotebookLM | `CapturingNotebookLmClient` | notebook_id, query sha, response sha + blob, sources cited | |
+
+`shared/http.py` and the other clients perform synchronous capture inline. **There is no `CapturedResponseFlow`.** A separate `BlobLifecycleJob` may compact, dedupe, or GC blobs but is not the primary recorder.
+
+### 4.6 Idempotency table
+
+```sql
+CREATE TABLE command_idempotency (
+    aggregate_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    result_event_ids_json TEXT NOT NULL,    -- ['evt_...', 'evt_...']
+    handled_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,               -- bounded retention
+    PRIMARY KEY (aggregate_id, command_id)
+);
+CREATE INDEX idx_idempotency_expires ON command_idempotency(expires_at);
+```
+
+Bounded retention: default 30 days, configurable. A background job purges expired rows.
+
+When an application service receives a command:
+1. Compute `command_id` (caller-supplied or content-hashed).
+2. Check the idempotency table; if hit, re-emit the previously recorded result events (or report success to caller without re-doing IO).
+3. Otherwise, perform IO + append, then write the idempotency row in the same transaction as the append.
+
+This handles command de-dupe without growing aggregate state.
+
+### 4.7 Upcaster registry
 
 ```python
 class Upcaster(Protocol):
@@ -285,53 +519,48 @@ class Upcaster(Protocol):
     @property
     def from_version(self) -> int: ...
     @property
-    def to_version(self) -> int: ...
+    def to_version(self) -> int: ...     # always from_version + 1
     def upcast(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+
+class UpcasterRegistry:
+    def register(self, upcaster: Upcaster) -> None: ...
+    def chain(self, event_type: str, from_version: int, to_version: int) -> Sequence[Upcaster]: ...
+    def upcast(self, event_type: str, payload: dict[str, Any], from_version: int) -> dict[str, Any]: ...
+
+    # Auto-discovery: any class with @register_upcaster decorator in `*.upcasters` modules
+    def autodiscover(self, packages: Iterable[str]) -> None: ...
 ```
 
-When loading events, the store applies the chain `from_version → from_version+1 → ... → current` for any matching event type. Ensures old events stay readable forever.
+Registry rules:
+1. For every `event_type`, the chain `from_version → from_version+1 → ... → current_version` must be complete (no gaps). Validated at startup; missing upcasters raise `UpcasterChainBroken`.
+2. Renamed event types use `EventTypeRename(old_name, new_name, at_version)` records; loader applies the rename before invoking type-specific upcasters.
+3. Each upcaster has at least one **golden fixture** test: input payload at `from_version` → expected payload at `to_version`. Fixtures are checked into `tests/upcaster_fixtures/{event_type}/v{from}_to_v{to}.json`.
+4. Every upcaster output is validated against the next-version Pydantic schema before being yielded. An upcaster that produces invalid output raises `UpcasterProducedInvalid`.
 
-### 4.5 Captured external responses
-
-Replay determinism requires capturing every external API response into the event log:
-
-```python
-class ExternalApiCalled(DomainEvent):
-    request_url: str
-    request_method: str
-    request_headers: dict[str, str]
-    response_status: int
-    response_body_sha256: str
-    response_body_path: Path           # blob stored in `runs/{project_id}/blobs/{sha}.bin`
-    duration_ms: int
-```
-
-In replay mode, HTTP calls short-circuit through the captured-response cache instead of hitting upstream. This is what makes runs *truly* reproducible.
+Snapshots also flow through upcasters via their `payload_schema_version` field.
 
 ## 5. Commands and Events — Module by Module
 
 ### 5.1 Intake (#12)
 
-#### Commands
-
 ```python
 @dataclass(frozen=True)
-class CreateProject(Command):
+class RegisterProject(Command):
+    command_id: CommandId
     source: PaperSource
 
 @dataclass(frozen=True)
-class FetchPaperContent(Command):
+class FetchPaper(Command):
+    command_id: CommandId
     project_id: ProjectId
-    source: PaperSource
 
 @dataclass(frozen=True)
 class ExtractMetadata(Command):
+    command_id: CommandId
     project_id: ProjectId
-```
 
-#### Events
 
-```python
 class ProjectCreated(DomainEvent):
     schema_version = 1
     project_id: ProjectId
@@ -342,126 +571,141 @@ class PaperFetched(DomainEvent):
     project_id: ProjectId
     raw_paper_path: str
     pdf_sha256: str
-    fetched_via: str    # adapter name
+    pdf_size_bytes: int
+    mime_validated: bool
+    fetched_via: str
+    fetched_interaction_id: InteractionId   # links to ExternalApiCalled
 
 class PaperFetchFailed(DomainEvent):
     schema_version = 1
     project_id: ProjectId
-    cause: str
-    cause_type: str
+    cause_kind: str
+    cause_message: str
     retryable: bool
 
 class MetadataExtracted(DomainEvent):
     schema_version = 1
     project_id: ProjectId
     metadata: PaperMetadata
+    extractor_name: str
+    extractor_version: str
 ```
 
-#### Aggregate
+**`ProjectAggregate.handle()` is pure**:
 
 ```python
 class ProjectAggregate(Aggregate):
     aggregate_type = "project"
     project_id: ProjectId
-    state: ProjectState     # CREATED | FETCHED | METADATA_EXTRACTED | FAILED
+    state: ProjectState
+    version: int
 
-    def handle(self, cmd: Command) -> Sequence[DomainEvent]:
-        match cmd:
-            case CreateProject(): return [ProjectCreated(...)]
-            case FetchPaperContent(): return self._handle_fetch(cmd)
-            case ExtractMetadata(): return self._handle_extract(cmd)
-            case _: raise UnsupportedCommand(cmd)
+    def handle_register(self, cmd: RegisterProject) -> Sequence[DomainEvent]:
+        if self.state is not ProjectState.NEW:
+            raise InvalidStateTransition(self.state, "register")
+        return [ProjectCreated(project_id=cmd.source_to_id(), source=cmd.source)]
+
+    def guard_can_fetch(self) -> None:
+        if self.state is not ProjectState.REGISTERED:
+            raise InvalidStateTransition(self.state, "fetch")
 
     def apply(self, ev: DomainEvent) -> None:
         match ev:
-            case ProjectCreated(): self.state = ProjectState.CREATED
+            case ProjectCreated(): self.state = ProjectState.REGISTERED
             case PaperFetched(): self.state = ProjectState.FETCHED
-            case ...
+            case PaperFetchFailed(): pass  # remains REGISTERED so retry is valid
+            case MetadataExtracted(): self.state = ProjectState.METADATA_KNOWN
 ```
 
-### 5.2 Parser (#13)
+The aggregate validates and emits state-transition events. **All HTTP, parsing, IO is in `IntakeAppService`.**
 
-#### Events
+### 5.2 Parser (#13)
 
 ```python
 class ParsingStarted(DomainEvent):
     project_id: ProjectId
     parser_name: str
     parser_version: str
+    parser_digest: str            # hash of parser package + weights (Nougat) or version string (PyMuPDF)
+    isolation_mode: str           # "in_process" | "subprocess" | "container"
 
 class SectionExtracted(DomainEvent):
     project_id: ProjectId
     section: Section
+    extraction_confidence: float  # 0..1
+    parser_warnings: tuple[str, ...]
 
-class ReferenceExtracted(DomainEvent):
+class EquationExtracted(DomainEvent):
     project_id: ProjectId
-    reference: Reference
+    equation: Equation            # latex, inline/display, anchor section_id
 
-class FigureExtracted(DomainEvent):
-    project_id: ProjectId
-    figure: Figure
-
-class TableExtracted(DomainEvent):
-    project_id: ProjectId
-    table: Table
+class ReferenceExtracted(DomainEvent): ...
+class FigureExtracted(DomainEvent): ...
+class TableExtracted(DomainEvent): ...
 
 class ParsingCompleted(DomainEvent):
     project_id: ProjectId
     section_count: int
     reference_count: int
+    figure_count: int
+    table_count: int
+    equation_count: int
     parse_duration_ms: int
+    full_text_blob_path: str      # raw concatenated text stored as blob
+    full_text_sha256: str
 
 class ParsingFailed(DomainEvent):
     project_id: ProjectId
     parser_name: str
-    cause: str
-    cause_type: str
+    cause_kind: str
+    cause_message: str
+    partial_progress: PartialProgress  # e.g. "extracted 4 of 9 sections"
     retryable: bool
 ```
 
-The parser emits one event per discovered section/reference/figure rather than dumping the whole `ParsedPaper` in a single event. This gives the dashboard fine-grained streaming and lets failed mid-parse runs preserve partial progress in the log.
+Equations are first-class because the PRD requires equations in the REPL workspace (PRD §1219-1224). `extraction_confidence` lets verifiers and indexers down-weight low-confidence extractions.
 
 ### 5.3 Discovery (#14)
 
 ```python
-class DiscoveryStarted(DomainEvent):
-    project_id: ProjectId
-    adapters: tuple[str, ...]
+class ArtifactTrust(StrEnum):
+    OFFICIAL = "official"           # paper authors' repo (e.g. arxiv author affiliation match)
+    RECOMMENDED = "recommended"     # Papers with Code canonical
+    COMMUNITY = "community"         # high-star fork
+    UNVERIFIED = "unverified"
 
-class AdapterStarted(DomainEvent):
+class DiscoveredArtifact(BaseModel):
+    id: ArtifactId
     project_id: ProjectId
-    adapter: str
+    kind: ArtifactKind
+    canonical_url: str
+    title: str
+    metadata: Mapping[str, Any]
+    trust: ArtifactTrust
+    license: str | None             # SPDX id or null
+    commit_sha: str | None          # for repo artifacts
+    last_updated: datetime | None
+    discovered_by: str
+    confidence: float
+    contradiction_evidence: tuple[str, ...]   # e.g. README claims python==3.6, requirements.txt says 3.8
+    discovered_at: datetime
+    discovery_interaction_id: InteractionId
 
 class ArtifactFound(DomainEvent):
     project_id: ProjectId
     adapter: str
     artifact: DiscoveredArtifact
-
-class AdapterFailed(DomainEvent):
-    project_id: ProjectId
-    adapter: str
-    cause: str
-    cause_type: str
-    retryable: bool
-
-class AdapterCompleted(DomainEvent):
-    project_id: ProjectId
-    adapter: str
-    artifact_count: int
-    duration_ms: int
-
-class DiscoveryCompleted(DomainEvent):
-    project_id: ProjectId
-    adapter_summaries: tuple[AdapterSummary, ...]
 ```
 
-Each adapter is a sub-flow: `AdapterStarted → many ArtifactFound → AdapterCompleted | AdapterFailed`.
+Trust scoring lives in `ingestion/discovery/trust.py`, computed deterministically from adapter outputs. Verifiers and the supervisor read trust on `ArtifactsProjection`.
 
 ### 5.4 Indexer (#15)
 
 ```python
 class IndexingStarted(DomainEvent):
     project_id: ProjectId
+    chunker_name: str
+    chunker_version: str
 
 class SourceRegistered(DomainEvent):
     project_id: ProjectId
@@ -471,63 +715,105 @@ class ChunkCreated(DomainEvent):
     project_id: ProjectId
     chunk: Chunk
 
+class EmbeddingQueued(DomainEvent):
+    project_id: ProjectId
+    chunk_id: ChunkId
+    embedding_model: str
+    embedding_model_digest: str
+
+class EmbeddingStarted(DomainEvent):
+    project_id: ProjectId
+    chunk_id: ChunkId
+
 class ChunkEmbedded(DomainEvent):
     project_id: ProjectId
     chunk_id: ChunkId
     embedding_model: str
+    embedding_model_digest: str
     embedding_dim: int
-    embedding_vector_path: str   # stored as blob; we don't put float32[1536] in the event payload
+    embedding_blob_path: str
+    duration_ms: int
+    interaction_id: InteractionId
+
+class EmbeddingFailed(DomainEvent):
+    project_id: ProjectId
+    chunk_id: ChunkId
+    cause_kind: str
+    retryable: bool
 
 class IndexingCompleted(DomainEvent):
     project_id: ProjectId
     source_count: int
     chunk_count: int
-    embedding_count: int
+    embedding_pending_count: int    # may be > 0; embeddings continue async
     duration_ms: int
-
-class IndexingFailed(DomainEvent):
-    project_id: ProjectId
-    cause: str
-    retryable: bool
 ```
 
-Embeddings stored as binary blobs referenced by hash; the event records the path. Same pattern as `ExternalApiCalled` for response bodies.
+`semantic_search()` may return results before all embeddings land. Result payloads carry `partial_index: bool` plus the count of embedded vs total chunks so callers can decide whether to wait.
 
 ### 5.5 Workspace (#16)
 
-```python
+# Scope, Citation, and NonEmptyCitations are imported from the canonical schema
+# packages owned by other teammates — we do NOT redefine them here.
+#
+#   from openresearch.contracts.blackboard import Scope             # owned by #11
+#   from openresearch.contracts.citations import (                  # owned by #8
+#       Citation,
+#       NonEmptyCitations,
+#   )
+#
+# Scope values (mirrors PRD §1078-1082 and #11):
+#   PRIVATE_TO_PARENT  — only the spawning agent sees it
+#   BRANCH_SHARED      — shared across an improvement branch
+#   GLOBAL_VERIFIED    — promoted after verifier confirmation
+#
+# NonEmptyCitations = Annotated[tuple[Citation, ...], Field(min_length=1)]
+
 class WorkspaceCreated(DomainEvent):
-    project_id: ProjectId
     workspace_id: WorkspaceId
+    project_id: ProjectId
     agent_name: str
+    parent_workspace_id: WorkspaceId | None
+    branch_id: BranchId | None
+    task_id: TaskId
 
 class VariableLoaded(DomainEvent):
     workspace_id: WorkspaceId
     variable_name: str
-    value_payload: dict        # serialized value
-    citations: tuple[Citation, ...]
+    value_payload: dict
+    citations: NonEmptyCitations
+    scope: Scope
     source_agent: str | None
 
 class VariableEnriched(DomainEvent):
     workspace_id: WorkspaceId
     variable_name: str
     value_payload: dict
-    citations: tuple[Citation, ...]
-    enriched_by: str           # agent that produced this variable
+    citations: NonEmptyCitations
+    scope: Scope
+    enriched_by: str
+
+class VariablePromoted(DomainEvent):
+    workspace_id: WorkspaceId
+    variable_name: str
+    from_scope: Scope
+    to_scope: Scope
+    promotion_event_id: EventId        # the verification event that authorized promotion
 
 class CitationAttached(DomainEvent):
     workspace_id: WorkspaceId
     decision_id: str
     decision_payload: dict
-    citations: tuple[Citation, ...]
+    citations: NonEmptyCitations
 
 class ToolInvoked(DomainEvent):
     workspace_id: WorkspaceId
     tool_name: str
     arguments: dict
     result_payload: dict
-    citations: tuple[Citation, ...]
+    citations: NonEmptyCitations
     duration_ms: int
+    interaction_id: InteractionId | None    # null if tool was pure (lookup); set if external (semantic_search → embedding+Chroma)
 
 class WorkspaceReady(DomainEvent):
     workspace_id: WorkspaceId
@@ -538,38 +824,25 @@ class WorkspaceClosed(DomainEvent):
     reason: str
 ```
 
-**Citation invariant — defense in depth.** Three independent layers enforce that no agent claim travels through the system without evidence:
+### 5.6 Citation invariant — defense in depth
 
-1. **Event payload Pydantic validators** — `VariableLoaded`, `VariableEnriched`, `CitationAttached`, `ToolInvoked` all declare `citations: Annotated[tuple[Citation, ...], Field(min_length=1)]`. Construction with empty citations raises `pydantic.ValidationError` before the event reaches the store.
-2. **EventStore append validation** — the store re-validates payloads via the registered Pydantic model on append. A hand-rolled dict bypassing the constructor still fails here.
-3. **Cited[T] projection construction** — when `WorkspaceProjection` materializes a variable, it builds `Cited[T]` whose `__post_init__` raises `CitationMissingError` on empty citations. Even a hypothetically-malformed event in storage cannot produce a valid in-memory `Cited[T]`.
+Three layers, each independently sufficient:
 
-The only construction path is: `Pydantic event → EventStore append → projection apply → Cited[T]`. Each link enforces the invariant. There is no backdoor.
+1. **Pydantic event-payload validators** — `NonEmptyCitations = Annotated[tuple[Citation, ...], Field(min_length=1)]`. Construction with empty tuple raises `pydantic.ValidationError`.
+2. **EventStore append re-validation** — every event arriving at `append()` is validated against its registered Pydantic class via `model_validate(...)`. **`model_construct` is banned outside tests** by an enforced lint rule (`ruff` check + reviewer guideline). Hand-rolled dicts that bypass the constructor still fail at append.
+3. **`Cited[T]` materialization in projections** — `WorkspaceProjection` constructs `Cited[T]` whose `__post_init__` raises `CitationMissingError` on empty citations.
 
-#### Cited[T] still exists — as a derived view
+Additionally — **semantic citation validation**:
 
-```python
-T = TypeVar("T", covariant=True)
+4. Every `Citation.source_id` referenced in a stored event must exist in `SourcesProjection`. The `WorkspaceAppService` re-checks before append (catches a stale handle before it lands in the log). The `WorkspaceProjection` re-checks on apply (catches projection-rebuild edge cases). Failed lookups emit `CitationSourceMissing` events, which `RetryCoordinator` treats as non-retryable until the corresponding source lands.
 
-@dataclass(frozen=True)
-class Cited(Generic[T]):
-    value: T
-    citations: tuple[Citation, ...]
+5. Every `Citation.chunk_id` (if non-null) must resolve to an immutable `Chunk` whose composed ID still matches its content (§7.2). A drifting chunk is detected and emits `CitationChunkDrifted`.
 
-    def __post_init__(self) -> None:
-        if not self.citations:
-            raise CitationMissingError(...)
-
-    @classmethod
-    def from_event(cls, event: VariableLoaded | VariableEnriched | ToolInvoked) -> "Cited[Any]":
-        return cls(value=event.value_payload, citations=event.citations)
-```
-
-The `WorkspaceProjection` materializes a `Workspace` view by replaying events into a structure where each variable is a `Cited[T]`. The agent reads from the projection; the projection is rebuildable from the event log; the event log itself enforces the invariant.
+The single canonical type `NonEmptyCitations` is defined in the canonical schema package (#8) and re-exported here; no per-event ad hoc annotations.
 
 ## 6. Projections
 
-### 6.1 General projection model
+### 6.1 General projection contract
 
 ```python
 class Projection(Protocol):
@@ -579,388 +852,507 @@ class Projection(Protocol):
     def subscribed_event_types(self) -> Iterable[str]: ...
     async def apply(self, event: StoredEvent) -> None: ...
     async def reset(self) -> None: ...
+
+    # Atomic checkpointing requirement:
+    #   If the projection's state lives in the same DB as projection_checkpoints
+    #   (e.g., SQLite), `apply` MUST update both in one transaction.
+    #   For external state (Chroma), see §6.2.
 ```
 
-Every projection persists a checkpoint (last applied `global_position`) so it can resume after restart. Checkpoints live in a dedicated `projection_checkpoints` table:
+### 6.2 SemanticIndexProjection — special handling
+
+Chroma cannot participate in the SQLite transaction. Therefore:
 
 ```sql
-CREATE TABLE projection_checkpoints (
-    projection_name TEXT PRIMARY KEY,
-    last_position INTEGER NOT NULL,
-    schema_version INTEGER NOT NULL,
-    updated_at TEXT NOT NULL
+CREATE TABLE semantic_index_log (
+    chunk_id TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding_model_digest TEXT NOT NULL,
+    event_global_position INTEGER NOT NULL,
+    applied_at TEXT NOT NULL,
+    chroma_collection TEXT NOT NULL,
+    PRIMARY KEY (chunk_id, embedding_model, embedding_model_digest)
 );
 ```
 
-Projections rebuild from scratch by `reset()` (truncate own state + delete checkpoint row) + replay from `global_position=0`. The checkpoint table also lets ops detect lagging projections (alert when `firehose_position - last_position > N`).
+- On `ChunkEmbedded`, the projection inserts the row in the same SQLite transaction as advancing its checkpoint, **before** calling Chroma. Then `chroma.add(...)` is called.
+- A repair job periodically diffs `semantic_index_log` against the Chroma collection contents and replays missing chunks.
+- On rebuild, the projection reads `semantic_index_log` rows + their referenced embedding blobs, and replays into a fresh Chroma collection. **No re-embedding.**
 
-### 6.2 Concrete projections
+### 6.3 Other projections
 
-**`ProjectsProjection`** — table indexed by `project_id` with current status, source, metadata. Used by dashboard project list + by intake idempotency checks.
+All SQLite-resident projections (`Projects`, `ParsedPapers`, `Artifacts`, `Sources`, `Workspace`, `CitationGraph`, `EventTimeline`) update state and checkpoint in one transaction.
 
-**`ParsedPapersProjection`** — sections, references, figures, full text. Indexed by `(project_id, section_id)`. Backed by SQLite tables.
+## 7. Coordinators (the inbox/outbox runtime)
 
-**`ArtifactsProjection`** — discovered artifacts indexed by `(project_id, kind)`. Powers the "official repo" lookup that downstream agents need.
-
-**`SourcesProjection`** — `SourceRef` and `Chunk` tables. Indexed by `(source_id)` and `(chunk_id)`. The lookup tool reads here.
-
-**`SemanticIndexProjection`** — Chroma collection per project. Embeddings written here on `ChunkEmbedded` events. The semantic search tool reads here. Rebuildable from events alone (re-embed everything on rebuild).
-
-**`WorkspaceProjection`** — per-workspace variable bindings, materialized as `Cited[T]`. Indexed by `(workspace_id, variable_name)`. Agent reads happen here.
-
-**`CitationGraphProjection`** — graph edges from claim → evidence chunks; from agent decision → cited evidence. Powers the dashboard's "show me where this claim came from" view.
-
-**`EventTimelineProjection`** — flat event timeline per project, indexed by time. Powers the dashboard's reasoning trace and replay UI.
-
-### 6.3 Projection rebuild
-
-Operationally critical: any projection can be rebuilt by `projection.reset() && replay(EventStore.load_global())`. This is how schema changes happen, how new projections are introduced, how corrupted read state is recovered.
-
-## 7. Process Managers (Flows)
+### 7.1 The runtime
 
 ```python
-class ProcessManager(Protocol):
-    @property
-    def name(self) -> str: ...
-    @property
-    def subscribed_event_types(self) -> Iterable[str]: ...
-    async def react(self, event: StoredEvent, dispatcher: CommandDispatcher) -> None: ...
+class CoordinatorRuntime:
+    def __init__(self, name: str, store: EventStore, dispatcher: CommandDispatcher, db: Database) -> None: ...
+
+    async def run(self, handler: CoordinatorHandler) -> None:
+        sub = await self.store.subscribe(self.name, types=handler.subscribed_types)
+        async for event in sub:
+            async with self.db.transaction():
+                if await self._already_handled(event):
+                    await sub.ack(event); continue
+                state = await self._load_state(handler.aggregate_key(event))
+                outcome = handler.handle(event, state)
+                await self._mark_handled(event)
+                if outcome.new_state is not None:
+                    await self._save_state(handler.aggregate_key(event), outcome.new_state)
+                for cmd in outcome.commands:
+                    await self._enqueue_outbox(cmd, event.event_id)
+            await sub.ack(event)
+
+        # outbox dispatcher runs in its own loop, drains coordinator_outbox
 ```
 
-Process managers persist their own state as event-sourced aggregates (`flow_state` aggregate type). On crash + restart, they replay their state and resume.
+`handler.handle(event, state)` is **pure** — no IO. Returns `(new_state, list[Command])`. This makes coordinators trivially testable.
 
-### `IngestionFlow`
-```
-on ProjectCreated      → dispatch(StartParsing(project_id)),
-                         dispatch(StartDiscovery(project_id))
-```
+### 7.2 Composed content-addressed IDs
 
-### `IndexingFlow`
-Joins parsing + discovery completion before triggering indexing:
-```
-on ParsingCompleted    → if discovery already complete: dispatch(StartIndexing)
-                         else: mark parsing-complete in flow state
-on DiscoveryCompleted  → if parsing already complete: dispatch(StartIndexing)
-                         else: mark discovery-complete in flow state
-```
-
-### `WorkspaceReadyFlow`
-```
-on IndexingCompleted   → dispatch(BuildWorkspace) for every agent registered to the project
-```
-
-### `RetryFlow`
-```
-on *Failed where retryable=True
-                       → schedule retry with exponential backoff (3 attempts max)
-                         dispatch the original command from the failed event's causation chain
+```python
+def chunk_id_for(
+    source_id: SourceId,
+    chunker_name: str,
+    chunker_version: str,
+    text: str,
+    span: tuple[int, int],
+    normalization: str = "nfkc-strip-trailing-ws-v1",
+) -> ChunkId:
+    digest = sha256()
+    digest.update(source_id.encode())
+    digest.update(b"\x00")
+    digest.update(chunker_name.encode()); digest.update(b"\x00")
+    digest.update(chunker_version.encode()); digest.update(b"\x00")
+    digest.update(span[0].to_bytes(8, "big")); digest.update(span[1].to_bytes(8, "big"))
+    digest.update(normalization.encode()); digest.update(b"\x00")
+    digest.update(text.encode())
+    return ChunkId(f"chk_{digest.hexdigest()[:24]}")
 ```
 
-### `CapturedResponseFlow`
-Listens to all external API calls made via `shared/http.py`, persists the captured request/response into the event log so replays are deterministic.
+A different chunker version produces a different ID for the same text — **no silent reuse**. Same for `SourceId`, `ArtifactId`, `EmbeddingId`.
 
 ## 8. Cross-Cutting Concerns
 
 ### 8.1 Event envelope
 
-Every stored event carries:
-
 ```python
 @dataclass(frozen=True)
 class EventEnvelope:
     event_id: EventId               # ULID
-    correlation_id: CorrelationId   # request-scoped, propagated through the whole flow
-    causation_id: EventId | None    # the event that caused this one
-    occurred_at: datetime           # UTC
-    source: str                     # service/module that produced the event
+    correlation_id: CorrelationId
+    causation_id: EventId | None
+    occurred_at: datetime
+    source: str                     # producing module
     schema_version: int
 ```
 
-Causation chains: `CreateProject` command → `ProjectCreated` event (causation=command id) → `IngestionFlow` reacts → `StartParsing` command (causation=`ProjectCreated`) → `ParsingStarted` event (causation=`StartParsing`) → ... You can walk back along `causation_id` to reconstruct *why* any event happened.
+### 8.2 Idempotency (commands and events)
 
-### 8.2 Schema evolution
+- Events: unique `event_id` index in the store catches exact duplicates.
+- Commands: `command_idempotency` table (§4.6) caches result event IDs per (aggregate_id, command_id).
+- Coordinator inbox (§3.5) catches event-handling duplicates per coordinator.
 
-Every event has `schema_version`. When a payload changes shape, register an upcaster. Old events stay valid forever. We never rewrite history.
+### 8.3 Concurrency
 
-### 8.3 Optimistic concurrency
+- Asyncio everywhere (`anyio`-portable).
+- SQLite single-writer; aggregate handlers serialized per-aggregate via `asyncio.Lock` keyed on `aggregate_id`.
+- Adapters within a service run concurrently (parser ∥ discovery; discovery adapters ∥ each other).
+- Projections run on independent persistent subscriptions; one slow projection cannot block another.
+- Coordinator outbox dispatchers run independently per coordinator with bounded concurrency.
 
-Each `append()` includes `expected_version`. If the aggregate's current version doesn't match, the append fails — the caller reloads and retries. Prevents lost updates without distributed locks.
+### 8.4 Schema evolution
 
-### 8.4 Idempotency
-
-- `event_id` is unique-indexed in the store. Re-emitting the same event id is a no-op.
-- Commands carry their own command_id; aggregate handlers de-dupe by command_id stored in their state.
-- Content-addressed IDs (Source, Chunk, Artifact) make re-ingest idempotent.
+`UpcasterRegistry` (§4.7). Snapshots flow through upcasters via their `payload_schema_version`. Renamed event types use `EventTypeRename` records. Every upcaster ships a golden fixture.
 
 ### 8.5 Replay determinism
 
-Three sources of non-determinism are captured into events:
-1. **External HTTP responses** — every call writes `ExternalApiCalled` with a body blob reference; replay short-circuits to the captured body.
-2. **Wall-clock time** — captured on every event as `occurred_at`. Aggregates accept a `Clock` dependency; in replay mode the clock returns event timestamps.
-3. **Random IDs** — generated from a seeded PRNG keyed by `correlation_id` so replays produce identical IDs.
+Three sources of non-determinism handled:
+
+1. **External interactions** — every HTTP / LLM / embedding / Chroma / web search / NotebookLM call is wrapped in a capturing client (§4.5) and recorded as `ExternalInteractionAttempted` + `ExternalApiCalled`/`ExternalApiFailed`. Replay mode (set via `OPENRESEARCH_REPLAY_MODE=true`) installs `ReplayInterceptor` which short-circuits all wrapped clients to captured responses keyed by `cache_key`.
+2. **Wall-clock time** — `Clock` Protocol injected into every service. `RealClock` in production; `EventTimeClock` in replay mode (returns `event.occurred_at`).
+3. **Random IDs** — `IdGenerator` Protocol. Production uses ULIDs; replay mode uses a seeded PRNG keyed by `correlation_id`. ID collisions in replay are impossible because the production-recorded IDs are themselves what gets replayed.
+
+Acceptance test (§14): two runs of a recorded session produce byte-identical event stores.
 
 ### 8.6 Error handling
 
-Errors are first-class events. Every command handler that fails emits a `*Failed` event with:
-- `cause: str`
-- `cause_type: str`  (e.g. `"httpx.ConnectError"`)
-- `retryable: bool` (handler decides based on cause_type)
-
-`RetryFlow` picks up retryable failures.
+- Every public method declares its raisable error types in the docstring.
+- Adapters wrap external errors in module-typed errors with `__cause__` preserved.
+- All failures emit a typed `*Failed` event with `retryable: bool` and `cause_kind` (a stable enum, not a free-form string).
+- `RetryCoordinator` retries `retryable=True` failures with exponential backoff; max 3 attempts; further failures move to a dead-letter table for ops review.
 
 ### 8.7 Observability
 
-- `structlog` — every log line includes `event_id`, `correlation_id`, `causation_id`, `aggregate_id`.
-- OpenTelemetry — spans named `Cmd:<CommandType>` and `Evt:<EventType>`; trace context propagated via envelope.
-- Prometheus metrics:
-  - `openresearch_events_appended_total{aggregate_type,event_type}`
-  - `openresearch_command_duration_seconds{command_type}`
-  - `openresearch_projection_lag{projection}` (events behind firehose)
-  - `openresearch_replay_duration_seconds{aggregate_type}`
-  - `openresearch_failed_events_total{event_type,retryable}`
+**Logs (structlog)** — every line carries `event_id`, `correlation_id`, `causation_id`, `aggregate_id`, `service`.
+
+**Traces (OpenTelemetry)** — span per command, per event apply, per projection apply, per external interaction. Trace context propagates via `EventEnvelope.correlation_id`.
+
+**Metrics (Prometheus)** — beyond the obvious counters/histograms:
+- `openresearch_events_appended_total{aggregate_type,event_type}`
+- `openresearch_command_duration_seconds{command_type}`
+- `openresearch_projection_lag{projection}` (events behind firehose)
+- `openresearch_subscription_retry_total{subscription_name}`
+- `openresearch_outbox_backlog{coordinator}`
+- `openresearch_dead_letter_total{coordinator}`
+- `openresearch_external_call_duration_seconds{surface,outcome}`
+- `openresearch_external_capture_failures_total{surface}`
+- `openresearch_circuit_breaker_state{host}` (gauge: 0=closed, 1=open, 2=half_open)
+- `openresearch_blob_missing_total`
+- `openresearch_blob_corrupt_total`
+- `openresearch_llm_tokens_total{model,direction}` (cost tracking)
+- `openresearch_security_policy_denied_total{policy}`
 
 ### 8.8 Configuration
 
-`pydantic-settings`-based `Settings` model loaded once at startup. Environment vars only for secrets. Frozen instance injected via DI container.
+`pydantic-settings` Settings model loaded once at startup. `OPENRESEARCH_*` env namespace. Frozen instance injected via DI. Secrets via env vars only.
 
-### 8.9 Concurrency
+### 8.9 Blob storage
 
-- Asyncio everywhere (`anyio`-portable).
-- Event store: SQLite single-writer, multi-reader. Aggregate handlers are serialized per-aggregate via `asyncio.Lock` keyed on `aggregate_id`.
-- Adapters run concurrently within their service (parser ∥ discovery; discovery adapters ∥ each other).
-- Projections run on independent subscriptions; one slow projection cannot block another.
-
-### 8.10 Security
-
-- API tokens via env vars only.
-- No `eval` / `exec` / `pickle` in the data path.
-- All HTTP TLS; no `verify=False`.
-- PDF parsing bounded: 100MB / 500 pages / 60s.
-
-## 9. Data Model — Plain Dataclasses
-
-Event payloads are Pydantic v2 (validation, JSON serialization). Domain types crossing aggregate boundaries are frozen dataclasses.
-
-```python
-@dataclass(frozen=True)
-class PaperMetadata: ...
-@dataclass(frozen=True)
-class Section: ...
-@dataclass(frozen=True)
-class Reference: ...
-@dataclass(frozen=True)
-class Figure: ...
-@dataclass(frozen=True)
-class Table: ...
-@dataclass(frozen=True)
-class DiscoveredArtifact: ...
-@dataclass(frozen=True)
-class SourceRef: ...
-@dataclass(frozen=True)
-class Chunk: ...
-@dataclass(frozen=True)
-class Citation: ...
-@dataclass(frozen=True)
-class Cited(Generic[T]): ...
+```
+runs/{project_id}/blobs/{first_two_of_sha}/{remaining_sha}.bin
 ```
 
-All IDs are `NewType` strings, content-hashed where possible, ULID-based otherwise.
+- **Atomic write** — write to `.tmp.{ulid}`, fsync, rename.
+- **SHA verification on read** — every blob read recomputes sha256 and matches the path. Mismatch raises `BlobCorruptError` and emits `BlobCorrupt` event.
+- **Refcounting** — `blob_refs` table records `(sha, event_id)` pairs. Unreferenced blobs older than retention go to a quarantine directory before delete.
+- **Encryption** — sensitive payloads (captured HTTP request body when it contains secrets, captured LLM prompts containing user data) are encrypted with a per-environment key (`OPENRESEARCH_BLOB_ENCRYPTION_KEY`) using authenticated encryption (AES-GCM).
+- **Max blob size** — configurable per surface; default 50MB. Larger raises `BlobTooLarge`.
+- **Cross-project dedupe** — content-addressed; a blob with sha X exists once globally and is referenced by all events that need it.
+
+### 8.10 Security (data-ingress hardening)
+
+**PDF parsing isolation** — `PyMuPdfParser` and `NougatParser` run in a subprocess worker with:
+- No network namespace (denies external access).
+- Memory limit 1 GB; CPU limit 2 cores; wall-clock 60s.
+- seccomp filter banning `socket`, `connect`, `clone3` (where supported).
+- AppArmor/SELinux profile when available.
+- Worker reads PDF blob path on stdin; emits parsed payload on stdout; killed on timeout.
+- A failed worker emits `ParsingFailed` with `cause_kind="worker_killed"`.
+
+**Embedding model integrity** —
+- `embedding_model_digest` is the sha256 of the model package + weights file. Pinned per environment via config. Mismatch at load time aborts startup.
+- Prefer `safetensors` over pickle. `torch.load(..., weights_only=True)` only.
+- No `trust_remote_code=True`. No implicit downloads in production (`HF_HUB_OFFLINE=1` after first cache).
+
+**Captured-header redaction** —
+- `HeaderRedactor` strips `Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization`, `X-Api-Key`, `X-Auth-Token` by default.
+- Custom redaction patterns from config.
+- Sensitive header values may be encrypted (per-env key) and stored as `enc:<blob_path>` references rather than plaintext, opt-in per surface.
+- Bearer tokens and cookies **never** reach projection tables or dashboard events.
+
+**Other hardening:**
+- No `eval` / `exec` / `pickle` / `marshal` / `__import__(user_string)` in the data path.
+- All HTTP TLS; no `verify=False`.
+- Dependency pinning via `uv.lock` or `requirements.lock`; weekly `pip-audit` in CI.
+- `bandit` and `ruff --select=S` in CI.
+
+### 8.11 Replay cache key
+
+```python
+def cache_key_for(
+    surface: str,
+    request_method: str | None,
+    request_url: str | None,
+    request_body_sha256: str | None,
+    surface_specific: Mapping[str, str],     # e.g. {"model": "claude-sonnet-4-6"}
+) -> str:
+    """Stable, surface-aware key used in replay-mode lookup."""
+```
+
+Stored in `ExternalInteractionAttempted.cache_key` and used by `ReplayInterceptor` to match captured responses. Includes surface-specific fields so two semantically-different calls with similar URLs do not collide (e.g., LLM calls with same prompt but different system message).
+
+## 9. Data Model Summary
+
+| Type | Defined in | Hash | Mutability |
+|------|-----------|------|------------|
+| `Project` | intake/aggregate | from-source ULID | frozen |
+| `ParsedPaper` | parser/projection (derived) | composed | frozen |
+| `Section`, `Reference`, `Figure`, `Table`, `Equation` | parser/events | content-hashed | frozen |
+| `DiscoveredArtifact` | discovery/events | content-hashed | frozen |
+| `SourceRef` | indexer/events | composed (parser+chunker version) | frozen |
+| `Chunk` | indexer/events | composed (chunker+span+normalization+text) | frozen |
+| `Citation` | workspace/model | n/a | frozen |
+| `NonEmptyCitations` | canonical (#8) re-export | n/a | typed alias, validated |
+| `Cited[T]` | workspace/model | n/a | frozen, ≥1 citation invariant |
+| Event payloads | per-module `events.py` | event_id ULID | frozen, Pydantic-validated |
 
 ## 10. Testing Strategy
 
-### 10.1 Test pyramid for event-sourced systems
+### 10.1 Test pyramid
 
-| Level | What | How |
-|---|---|---|
-| Aggregate behavior | Given events → command → expected new events | Pure unit, no infrastructure. The bread-and-butter test. |
-| Event payload schemas | Pydantic round-trip; upcaster correctness | Property tests (Hypothesis) + golden fixtures |
-| Projection replay | Stream of events → expected projection state | Run projection in-memory against synthetic event stream |
-| Command handler integration | Command → aggregate → events appended → projection caught up | In-memory event store, real handlers, real projections |
-| Adapter contract | Real adapter against recorded HTTP fixture (VCR.py) | One cassette per adapter happy path + ≥1 failure mode |
-| End-to-end | Submit `CreateProject(arxiv://1707.06347)` → `WorkspaceReady` event observed | In-process app with real SQLite store, recorded HTTP fixtures |
-| Replay determinism | Two runs of same recorded session produce identical event streams | Golden test: snapshot one run, replay, diff |
-| Smoke (live API) | Hits real arXiv / GitHub / PWC | Marked `smoke`, nightly only |
+| Level | Coverage |
+|---|---|
+| Aggregate unit | Given prior events → command → expected new events (pure, no infra) |
+| Schema round-trip | Pydantic validate → JSON → validate, property-based via Hypothesis |
+| Upcaster golden fixtures | One per `(event_type, from_version → to_version)` pair |
+| Projection replay | Synthetic event stream → expected projection state |
+| Service integration | Command → service → store → projection caught up |
+| Adapter contract | Real adapter against recorded HTTP fixtures |
+| Coordinator handler | `handler.handle(event, state)` purity tests |
+| Replay determinism | Run twice; diff event store byte-by-byte |
+| Crash injection | Faults injected at append/outbox/checkpoint boundaries; recovery to consistent state |
+| End-to-end | `RegisterProject(arxiv://1707.06347)` → `WorkspaceReady` |
+| Smoke (live API) | Marked `smoke`; nightly only |
 
-### 10.2 Aggregate test pattern
+### 10.2 Crash-injection matrix
 
-```python
-def test_create_project_emits_project_created():
-    aggregate = ProjectAggregate.empty()
-    events = aggregate.handle(CreateProject(source=ArxivId(id="1707.06347")))
-    assert [type(e) for e in events] == [ProjectCreated]
-    assert events[0].source == ArxivId(id="1707.06347")
+A dedicated test harness inserts faults at:
+- After append, before commit (transaction rollback).
+- After commit, before outbox enqueue.
+- After outbox enqueue, before dispatcher ack.
+- During projection apply, between state mutation and checkpoint update.
+- During capturing client, between `*Attempted` and `*Called`.
+- During snapshot save, after metadata, before payload.
 
-def test_project_cannot_be_created_twice():
-    aggregate = ProjectAggregate.empty()
-    aggregate.apply(ProjectCreated(...))
-    with pytest.raises(ProjectAlreadyExists):
-        aggregate.handle(CreateProject(...))
-```
+Each injection point has at least one assertion: "after restart, the system is in a consistent state and the same logical work eventually completes".
 
-### 10.3 Replay determinism test
+### 10.3 Invariants verified
 
-```python
-async def test_replay_is_byte_identical():
-    # First run, captures all external HTTP into the event log
-    run1 = await app.execute(CreateProject(source=ArxivId(id="1707.06347")))
-    snapshot1 = await app.event_store.dump()
-
-    # Tear down store; second run replays in deterministic mode
-    await app.reset()
-    run2 = await app.replay(snapshot1)
-    snapshot2 = await app.event_store.dump()
-
-    assert snapshot1 == snapshot2
-```
-
-### 10.4 Invariants verified by tests
-
-1. `Cited[T](value=x, citations=())` raises `CitationMissingError`.
-2. Event payloads with empty citations fail Pydantic validation.
-3. Re-ingesting same source produces identical SourceIds and ChunkIds.
-4. One failing discovery adapter does not fail the project (it emits `AdapterFailed`).
-5. Optimistic concurrency: concurrent `append()` to same aggregate with same `expected_version` — exactly one succeeds.
-6. Projection rebuild from event log produces identical state to the live projection.
-7. Replay is deterministic when external responses are captured.
+1. `Cited[T]` cannot be constructed empty.
+2. `NonEmptyCitations` validation rejects empty tuples at Pydantic level.
+3. `EventStore.append` rejects events whose payload fails revalidation.
+4. Re-ingesting the same source yields identical SourceIds and ChunkIds.
+5. Concurrent appends to the same aggregate with same `expected_version` — exactly one succeeds.
+6. Projection rebuild from event log == live projection state.
+7. Replay is byte-deterministic when external responses are captured.
+8. `coordinator_inbox` ensures each event handled at most once per coordinator.
+9. Aggregates never call IO (static check via `pylint` rule + reviewer guideline).
+10. `model_construct` is banned outside `tests/` (`ruff` rule).
 
 ## 11. Sequencing & Migration
 
 ### 11.1 Implementation order
 
-| Order | Module / Issue | Notes |
+| Order | Module | Cross-team blocker |
 |---|---|---|
-| 1 | `eventstore/` + `messaging/` + `shared/` | Foundation — nothing ships without it |
-| 2 | `flows/captured_response_flow.py` + `shared/http.py` | Determinism in place from day 1 |
-| 3 | `ingestion/intake/` (#12) | First aggregate; first projection; smoke test passes |
-| 4 | `ingestion/parser/` (#13) | PyMuPdfParser; Nougat slot exists, ships later |
-| 5 | `ingestion/discovery/` (#14) | GitHub + PWC adapters; HF + S2 land later |
-| 6 | `flows/ingestion_flow.py` + `flows/indexing_flow.py` | Workflow comes alive |
-| 7 | `context/indexer/` (#15) | SectionChunker first; embeddings shipped via separate event |
-| 8 | `context/workspace/` (#16) | Cited, Workspace, lookup + semantic_search tools |
-| 9 | `flows/workspace_ready_flow.py` | End-to-end runs from one command to a ready workspace |
-| 10 | `flows/retry_flow.py` | Resilience hardening pass |
-| 11 | All projections | Some land alongside their aggregates; CitationGraph + EventTimeline land last |
+| 1 | `eventstore/` + `messaging/` + `shared/` + `capture/blob_store.py` | none |
+| 2 | `capture/http_client.py` + `capture/replay_mode.py` | none |
+| 3 | `coordinators/runtime.py` + base inbox/outbox tables | none |
+| 4 | `ingestion/intake/` (#12) + `IngestionCoordinator` + `ProjectsProjection` | none |
+| 5 | `ingestion/parser/` (#13) — PyMuPDF in subprocess worker | none |
+| 6 | `ingestion/discovery/` (#14) — GitHub + PWC adapters first | none |
+| 7 | `coordinators/indexing_coordinator.py` + `coordinators/embedding_coordinator.py` | none |
+| 8 | `context/indexer/` (#15) — chunkers, indexer service, source/embedding events | uses placeholder #8 schemas; clean swap when #8 lands |
+| 9 | `context/workspace/` (#16) — `Cited[T]`, scope, lookup tool | uses placeholder #8 schemas + #9 SQLite shim; clean swap |
+| 10 | `coordinators/workspace_ready_coordinator.py` (subscribes to AgentRegistry events from #10/#2) | depends on #10's AgentRegistered event existing; can be stubbed against contract |
+| 11 | `capture/llm_client.py` + `capture/embedding_client.py` + `capture/chroma_client.py` + `capture/web_search_client.py` + `capture/notebook_lm_client.py` | none |
+| 12 | Remaining projections (`CitationGraph`, `EventTimeline`, `OutboxBacklog`) | none |
+| 13 | Crash-injection test suite | gates production declaration |
+| 14 | Security hardening pass (parser worker isolation, model digest pinning, header redaction in CI) | gates production declaration |
 
-### 11.2 Migration when #8 lands (canonical schemas)
+### 11.2 Migration when #8 lands
 
-Our event payload classes (in `*/events.py`) become aliases for canonical models from rishi-golla's #8 package. Upcasters handle any divergence. Estimated cost: half a day.
+`NonEmptyCitations` and other shared types relocate to the canonical schema package. Our event payload classes import from there. Estimated cost: 1 day (the registry contract makes this mechanical; migration is gated by upcaster golden-fixture tests passing).
 
-### 11.3 Migration when #9 lands (SQLite repository)
+### 11.3 Migration when #9 lands
 
-#9 provides a *generic* SQLite repository layer. Two paths:
+If #9's repository abstracts over SQLite the same way ours does, replace projection persistence with #9 (event store keeps its own schema; event sourcing schemas don't fit a generic repo). Estimated cost: 1.5 days including tests.
 
-1. Adopt #9's repository for projections (read models). Our `EventStore` keeps using its own SQLite schema (event sourcing requires very specific schema; not a fit for a generic repo).
-2. Continue using our own SQLite for both event store and projections; adopt #9 only where it adds value (e.g., shared transactions across read models).
+### 11.4 Move beyond SQLite
 
-I recommend (1). Estimated cost: 1 day.
+Triggered by §4.3. Effort:
+- EventStoreDB: ~1 week to port `EventStore` and `Subscription` Protocols + golden replay tests.
+- Postgres: ~1.5 weeks (we lose persistent subscriptions but gain SQL ops); add a notification bridge (LISTEN/NOTIFY).
+- NATS JetStream: only as a fan-out bus paired with one of the above.
 
-### 11.4 When the system grows past one node
-
-The Protocol-bounded `EventStore` swaps in:
-- **EventStoreDB** (purpose-built, recommended for strong-consistency multi-node).
-- **Postgres** with `notify` for subscriptions (operationally familiar).
-- **NATS JetStream** (cloud-native, partitioned).
-
-No service code changes; only the binding.
-
-## 12. Open Questions / Decisions Pending
+## 12. Open Questions
 
 | # | Question | Default |
-|---|----------|---------|
-| OQ1 | Embedding model for `SemanticSearchTool` | `all-MiniLM-L6-v2`; pluggable |
-| OQ2 | Snapshot frequency for `Workspace` | every 50 events |
-| OQ3 | Should `ChunkEmbedded` events live in the same store as everything else? | Yes — uniform store; embeddings as blob references, not inline |
-| OQ4 | How are issue/discussion threads chunked? | One chunk per top-level body, one per comment |
-| OQ5 | Event retention policy | Forever for now; revisit at 100M events |
-| OQ6 | Do projections live in the same DB file? | Yes (separate SQLite tables); ops simplicity wins. Move to dedicated read-DB later if needed. |
-| OQ7 | Process manager state — own aggregates or simple key-value? | Own event-sourced aggregates (consistency with rest of system) |
+|---|---|---|
+| OQ1 | Default embedding model | `sentence-transformers/all-MiniLM-L6-v2`; pluggable; digest pinned |
+| OQ2 | Default snapshot threshold | start at 100ms aggregate replay; tune with metrics |
+| OQ3 | Issue/discussion thread chunking | one chunk per top-level body; one per comment |
+| OQ4 | Event retention policy | forever; revisit at 100M events |
+| OQ5 | Projection storage | same SQLite file as event store; separate read-DB later |
+| OQ6 | Captured-header encryption-by-default vs redact-only | redact-only by default; encrypt for `embedding`/`llm`/`notebook_lm` surfaces (these may carry user data) |
+| OQ7 | Idempotency retention | 30 days |
+| OQ8 | Dead-letter retention | forever (operational evidence) |
+| OQ9 | Trust scoring rules for `ArtifactTrust` | initial heuristic in `discovery/trust.py`; promote to config when we have real data |
+| OQ10 | When does AgentRegistry promote a variable to `GLOBAL_VERIFIED`? | on receipt of a passing Method Fidelity + Data & Metrics + Artifact verifier triple, with Supervisor binding |
 
-## 13. Out-of-Scope for This Spec
+## 13. Out-of-Scope
 
 - Agent runtime / Docker sandbox — separate umbrella.
 - Agent orchestrator + spawn policy — separate umbrella.
-- Verifier team and improvement agents — they are **event consumers** of this layer, but live elsewhere.
-- Frontend rendering — subscribes to event store + projections.
+- Verifier team and improvement agents — they consume our events; they live elsewhere.
+- Frontend rendering — subscribes to projections + firehose; not built here.
 - Six REPL tools beyond `lookup` and `semantic_search` — Protocol slots ready; impls land later.
 - Knowledge graph (Graphify) — Phase 2 per PRD.
 
 ## 14. Acceptance Criteria
 
-A complete pass of this spec produces:
+These are **requirements**, not a checklist. Each must have explicit tests.
 
-- [x] `python -m openresearch.cli arxiv://1707.06347` triggers the full pipeline; `WorkspaceReady` is observed for the default agent set.
-- [x] Re-ingesting the same source emits exactly the same `SourceRegistered` and `ChunkCreated` events (idempotent).
-- [x] A discovery adapter raising `RuntimeError` produces `AdapterFailed` and `DiscoveryCompleted`; `IndexingStarted` still fires.
-- [x] `Cited[T]` cannot be constructed empty; `VariableEnriched` cannot be appended with empty citations.
-- [x] Replaying the captured event log on a fresh store produces a byte-identical store.
-- [x] Killing the orchestrator mid-flow and restarting causes flows to resume from `correlation_id` reconstruction.
-- [x] All projections rebuild cleanly from `EventStore.load_global()`.
-- [x] `mypy --strict` passes; tests green; smoke skipped by default.
-- [x] OpenTelemetry traces show full causation chains end-to-end.
-- [x] Prometheus metrics exposed at `/metrics`.
+- [ ] `python -m openresearch.cli register arxiv://1707.06347` triggers full pipeline; `WorkspaceReady` is observed for the default agent set, witnessed in `EventTimelineProjection`. Test: `tests/e2e/test_arxiv_to_workspace_ready.py`.
+- [ ] Re-ingesting the same source emits identical `SourceRegistered`/`ChunkCreated`/`ChunkEmbedded` events. Test: `tests/e2e/test_idempotent_reingest.py`.
+- [ ] One discovery adapter raising `RuntimeError` produces `AdapterFailed` and `DiscoveryCompleted`; `IndexingStarted` still fires. Test: `tests/integration/test_discovery_isolation.py`.
+- [ ] `Cited[T](value=x, citations=())` raises `CitationMissingError`. Test: `tests/unit/test_cited_invariant.py`.
+- [ ] `VariableEnriched(citations=())` fails Pydantic validation. Test: `tests/unit/test_event_validators.py`.
+- [ ] `EventStore.append([VariableEnriched_with_empty_citations])` raises `AppendError`. Test: `tests/integration/test_append_revalidation.py`.
+- [ ] Replaying captured event log on fresh store produces byte-identical store. Test: `tests/replay/test_byte_identical_replay.py`.
+- [ ] Killing parser worker mid-flow → `ParsingFailed(retryable=True)` → `RetryCoordinator` re-issues → second attempt completes. Test: `tests/integration/test_parser_crash_retry.py`.
+- [ ] Killing the orchestrator after `coordinator_outbox` write but before dispatch → outbox dispatcher recovers on restart and emits the queued command. Test: `tests/crash/test_outbox_recovery.py`.
+- [ ] Projection rebuild from `EventStore.load_global()` produces state byte-identical to live projection. Test: `tests/integration/test_projection_rebuild.py`.
+- [ ] Captured `Authorization` header never appears in any projection table. Test: `tests/security/test_no_credential_leak.py`.
+- [ ] Loaded embedding model digest mismatch aborts startup. Test: `tests/security/test_model_digest_pin.py`.
+- [ ] PDF parser running in subprocess; killed on timeout; emits `ParsingFailed(cause_kind="worker_killed")`. Test: `tests/security/test_parser_isolation.py`.
+- [ ] `mypy --strict` passes. Test: CI gate.
+- [ ] OpenTelemetry traces show full causation chain end-to-end. Test: `tests/observability/test_trace_propagation.py`.
+- [ ] Prometheus metrics exposed at `/metrics` and contain all metric names listed in §8.7. Test: `tests/observability/test_metrics_exposed.py`.
 
-## 15. Appendix — File-by-File Summary
+## 15. Cross-Team Contracts and Boundaries
 
-(Module → file → purpose, for handoff to implementation.)
+This spec depends on contracts owned by other teammates. Our work must compose without drift.
+
+### 15.1 Imports from #8 (canonical schemas — armaanamatya)
+
+| Imported | Used in | Notes |
+|---|---|---|
+| `EventEnvelope` (correlation_id, causation_id, occurred_at, schema_version, source) | every domain event | We declare event payloads; **#8 owns the envelope shape** |
+| `Citation` | every citation-bearing event | Owned by #8 |
+| `NonEmptyCitations = Annotated[tuple[Citation, ...], Field(min_length=1)]` | `VariableLoaded`, `VariableEnriched`, `CitationAttached`, `ToolInvoked`, etc. | Single canonical type; no per-event ad hoc annotations |
+| `TaskStatus` enum (`created`, `context_prepared`, `running`, `artifact_submitted`, `verification_pending`, `verified`, `failed`, `blocked_requires_human`) | task references | We do not redefine; we reference |
+| Event-stream payload contract for `task updates`, `context enrichment`, `citations`, `artifact submissions` | every event we publish to the dashboard firehose | We register our domain events against #8's payload schema; if the shapes diverge, we open a coordination PR |
+
+### 15.2 Imports from #11 (blackboard scopes — armaanamatya)
+
+| Imported | Used in | Notes |
+|---|---|---|
+| `Scope` enum (`private_to_parent`, `branch_shared`, `global_verified`) | `WorkspaceCreated`, `VariableLoaded`, `VariableEnriched`, `VariablePromoted` | **Same enum** across blackboard and workspace; we import, not redeclare |
+| Blackboard publish API | a `BlackboardPublishCoordinator` (consumes `VariablePromoted` events) | Promotion to `BRANCH_SHARED` or `GLOBAL_VERIFIED` triggers a blackboard publish via #11's API; we do **not** duplicate blackboard storage |
+| Delegation tree IDs (`task_id`, `parent_task_id`, `branch_id`) | `WorkspaceCreated.task_id`, `parent_task_id`, `branch_id` | Foreign keys into #11's delegation tree |
+
+### 15.3 Imports from #10 (task lifecycle — armaanamatya)
+
+| Imported | Used in | Notes |
+|---|---|---|
+| `TaskId`, `agent_task` identity | foreign key on `Workspace*` events | We carry foreign keys, never duplicate the lifecycle |
+| `AgentRegistered` / `AgentDeregistered` events (or equivalent) | `WorkspaceReadyCoordinator` subscription | We subscribe to learn which agents need workspaces built |
+
+We do **not** own any module called `registry/`. The agent registry concept belongs to #2/#10.
+
+### 15.4 Boundary with #9 (SQLite repository — armaanamatya)
+
+- **Our event store is its own SQLite file** (`runs/events.db`) with its own schema. It does **not** use #9's repository abstraction; event-sourcing schemas don't fit a generic CRUD repo.
+- **Projections** that materialize entities #9 owns (`messages`, `artifacts`, `runs`, `verifications`) MAY be implemented by writing through #9's repository when those projections come online. Default is to keep our projection storage separate to avoid blocking on #9.
+- We expose our event firehose (`EventStore.subscribe`) so #9-owned services or any other consumer can derive their own state.
+
+### 15.5 Boundary with #7 (backend app skeleton — armaanamatya)
+
+- The module layout in §3.6 slots **under #7's chosen app skeleton**. Final paths may shift (e.g., `src/openresearch/...` vs `openresearch/...`) once #7 lands; we will rebase rather than redefine.
+- We adopt #7's config-loading pattern; `pydantic-settings` is the agreed default.
+- Our `shared/observability.py` integrates with #7's structured logger if one exists; otherwise we ship structlog and #7 adopts.
+
+### 15.6 Boundary with #2 / #11 (orchestrator + blackboard — armaanamatya)
+
+- We do **not** implement orchestrator state. Our coordinators (§3.5) coordinate **our own pipeline**, not agent task spawn/lifecycle.
+- When a workspace variable is promoted to `BRANCH_SHARED` or `GLOBAL_VERIFIED`, our `BlackboardPublishCoordinator` calls #11's blackboard publish API. We do not write blackboard records directly.
+- Spawn-policy guards (max depth, max fan-out) are **#11's responsibility**. We respect their `agent_task` lineage; we do not enforce policy ourselves.
+
+### 15.7 Boundary with #5 / #17 (LocalDocker sandbox — rishi-golla)
+
+- Out of scope for our spec. We do not define `RuntimeBackend` and we do not own the Docker lifecycle.
+
+### 15.8 Boundary with #18 (experiment runner — rishi-golla)
+
+- Out of scope. Our pipeline ends at `WorkspaceReady`. The runner consumes downstream task records, not our events.
+
+### 15.9 Boundary with #19 (provenance manifests — rishi-golla)
+
+- **Citations and provenance are different concepts** that may cross-reference:
+  - A `Citation.source_id` may point to a `SourceRef` (paper section, repo file, issue thread) — owned by us.
+  - A `Citation.source_id` may also point to an `Artifact` recorded by #19's provenance manifest (e.g., "metric was produced by this captured run"). We add a `SourceKind.PROVENANCE_ARTIFACT` for this case, and the `SourceRef.locator` carries #19's artifact ID.
+- Coordination needed with #19 owner: agree on the artifact ID format and lookup interface so our citation system can link to their provenance records without duplication.
+
+### 15.10 Boundary with #20 / #21 (Next.js dashboard — rishi-golla)
+
+- Dashboard subscribes to:
+  1. Our event firehose (via `EventTimelineProjection` and the `/events/stream` SSE endpoint owned by #20).
+  2. Our citation graph (`CitationGraphProjection`).
+  3. Our workspace projection for variable views.
+- All event payloads conform to #8's contract so the dashboard's mock event adapter (#20) can simulate them deterministically.
+- Headers and other potentially-sensitive fields are **redacted before they leave our process** (§8.10), so the dashboard never sees credentials.
+
+### 15.11 Where we ship contracts back
+
+Some types in this spec are ours to define and they need to be visible to teammates:
+
+| Contract | Owned by | Consumers |
+|---|---|---|
+| `SourceRef`, `Chunk`, `SourceKind`, `ChunkType` | us | #21 dashboard (citation panel), #19 may reference for cross-link |
+| `Workspace*` event payloads | us (registered via #8 envelope) | #21 dashboard, verifiers |
+| `ExternalApiCalled` and other capture events | us | replay tooling, audit views in #21 |
+| `Cited[T]` materialized view | us | agent runtime (out of scope here) |
+
+We surface these via a small `openresearch.contracts.ingestion_context` module checked in alongside our code; teammates import from there.
+
+### 15.12 Update protocol when upstream contracts change
+
+1. Open a PR against this spec referencing the upstream change.
+2. Add an upcaster (§4.7) if event payloads shift.
+3. Run `tests/integration/test_cross_team_contracts.py` which validates we still consume the upstream shape correctly.
+4. If incompatible, escalate; do not silently drift.
+
+## 16. Appendix — File-by-File Summary
 
 ```
-eventstore/interface.py                 EventStore Protocol
+eventstore/interface.py                 EventStore + Subscription + StoreCapabilities Protocols
 eventstore/sqlite_store.py              SQLiteEventStore (production default)
 eventstore/jsonl_store.py               JsonlEventStore (debug, ops dump)
-eventstore/snapshot.py                  Snapshot Protocol + SqliteSnapshotStore
-eventstore/upcaster.py                  Upcaster Protocol + registry
-eventstore/subscription.py              long-lived subscription primitive
-eventstore/replay.py                    bulk replay engine
+eventstore/snapshot.py                  Snapshot + SnapshotEnvelope + integrity checks
+eventstore/upcaster.py                  Upcaster + UpcasterRegistry + autodiscover
+eventstore/subscription.py              Persistent subscription with checkpoint/ack/nack/lease
+eventstore/replay.py                    Bulk replay + determinism harness
 
-messaging/command.py                    Command base + CommandDispatcher
-messaging/event.py                      DomainEvent base + StoredEvent + EventEnvelope
+messaging/command.py                    Command + CommandDispatcher
+messaging/event.py                      DomainEvent + StoredEvent + EventEnvelope
+messaging/idempotency.py                CommandIdempotencyTable
 messaging/bus.py                        InProcMessageBus, NatsMessageBus (slot-in)
 
-ingestion/intake/commands.py            CreateProject, FetchPaperContent, ExtractMetadata
-ingestion/intake/events.py              ProjectCreated, PaperFetched, MetadataExtracted, *Failed
-ingestion/intake/aggregate.py           ProjectAggregate
-ingestion/intake/adapters/{pdf,arxiv,doi}.py
-ingestion/intake/projections.py         ProjectsProjection
+coordinators/runtime.py                 CoordinatorRuntime (inbox + state + outbox)
+coordinators/ingestion_coordinator.py
+coordinators/indexing_coordinator.py
+coordinators/workspace_ready_coordinator.py
+coordinators/retry_coordinator.py
+coordinators/embedding_coordinator.py
 
-ingestion/parser/commands.py            StartParsing
-ingestion/parser/events.py              ParsingStarted, SectionExtracted, ..., ParsingCompleted, ParsingFailed
-ingestion/parser/aggregate.py           ParsedPaperAggregate
-ingestion/parser/{pymupdf,nougat}_parser.py
-ingestion/parser/projections.py         ParsedPapersProjection
+ingestion/intake/{commands,events,aggregate,service}.py
+ingestion/intake/fetchers/{pdf,arxiv,doi}.py
+ingestion/intake/projections.py
 
-ingestion/discovery/commands.py         StartDiscovery
-ingestion/discovery/events.py           DiscoveryStarted, AdapterStarted, ArtifactFound, AdapterFailed, AdapterCompleted, DiscoveryCompleted
-ingestion/discovery/aggregate.py        DiscoveryAggregate
+ingestion/parser/{commands,events,aggregate,service}.py
+ingestion/parser/{pymupdf_parser,nougat_parser}.py
+ingestion/parser/workers/{pymupdf_worker,nougat_worker}.py    # subprocess isolation
+ingestion/parser/projections.py
+
+ingestion/discovery/{commands,events,aggregate,service,trust}.py
 ingestion/discovery/adapters/{github,papers_with_code,huggingface,semantic_scholar}.py
-ingestion/discovery/projections.py      ArtifactsProjection
+ingestion/discovery/projections.py
 
-context/indexer/commands.py             StartIndexing
-context/indexer/events.py               IndexingStarted, SourceRegistered, ChunkCreated, ChunkEmbedded, IndexingCompleted, IndexingFailed
-context/indexer/aggregate.py            IndexAggregate
+context/indexer/{commands,events,aggregate,service,embedder}.py
 context/indexer/chunkers/{section,paragraph,code_block}.py
-context/indexer/projections.py          SourcesProjection, SemanticIndexProjection
+context/indexer/projections.py                                # SourcesProjection, SemanticIndexProjection (with semantic_index_log)
 
-context/workspace/commands.py           BuildWorkspace, AttachCitation, CallTool, EnrichVariable, CloseWorkspace
-context/workspace/events.py             WorkspaceCreated, VariableLoaded, VariableEnriched, CitationAttached, ToolInvoked, WorkspaceReady, WorkspaceClosed
-context/workspace/aggregate.py          WorkspaceAggregate
-context/workspace/model.py              Cited[T], Citation, Provenance
+context/workspace/{commands,events,aggregate,service,model}.py
 context/workspace/tools/{interface,lookup,semantic_search}.py
-context/workspace/projections.py        WorkspaceProjection, CitationGraphProjection
+context/workspace/projections.py                              # WorkspaceProjection, CitationGraphProjection
 
-flows/ingestion_flow.py                 IngestionFlow
-flows/indexing_flow.py                  IndexingFlow (joins parsing + discovery)
-flows/workspace_ready_flow.py           WorkspaceReadyFlow
-flows/retry_flow.py                     RetryFlow
-flows/captured_response_flow.py         CapturedResponseFlow
+capture/{http_client,llm_client,embedding_client,chroma_client,web_search_client,notebook_lm_client}.py
+capture/blob_store.py                  Atomic blob write + GC + encryption
+capture/replay_mode.py                 ReplayInterceptor
 
-shared/ids.py                           NewType ID generators
-shared/envelope.py                      EventEnvelope, CorrelationId helpers
-shared/errors.py                        OpenResearchError hierarchy
-shared/http.py                          httpx + rate limit + circuit breaker + capture
-shared/observability.py                 structlog + OpenTelemetry helpers
-shared/config.py                        pydantic-settings Settings
+shared/ids.py                          Composed content-addressed IDs
+shared/envelope.py                     EventEnvelope helpers
+shared/errors.py                       OpenResearchError hierarchy
+shared/observability.py                structlog + OpenTelemetry helpers
+shared/security.py                     HeaderRedactor + SecretEncryptor + ModelDigestVerifier
+shared/config.py                       pydantic-settings Settings
 ```
 
 ---
 
-**End of design.**
+**End of design (revision 2).**
