@@ -39,6 +39,10 @@ This section verifies that the PRD reflects the key product decisions from the p
 | Index baseline paper context and field history for agent retrieval. | Research Context Index, Context Management, Implementation Details. | Captured |
 | Use Recursive Language Models (RLM) for context exploration instead of vector-store retrieval. | Context Management, Research Context Index, Technology Stack. | Captured |
 | Define how agents communicate and pass structured outputs to each other. | Inter-Agent Communication Protocol, Context Management. | Captured |
+| Support recursive specialist delegation beyond one orchestrator -> one subagent layer. | Dynamic Recursive Delegation Model, Inter-Agent Communication Protocol. | Captured |
+| Define spawn policy: when to spawn, how many children, how deep, and when to stop or escalate. | Spawn Policy And Recursive Delegation Rules. | Captured |
+| Route work by agent capabilities instead of relying only on a fixed hard-coded agent list. | Agent Registry And Capability Model, Dynamic Recursive Delegation Model. | Captured |
+| Add a blackboard/shared state model for multi-level delegation while keeping orchestrator control. | Shared State And Blackboard Model, Shared State Write Protocol. | Captured |
 | Consider graph-based context (Graphify) for structural code/paper analysis. | Knowledge Graph (Storage Layers), Technology Stack, Production Roadmap Phase 2. | Captured |
 | Consider blackboard architecture for production-scale agent coordination. | Production Roadmap Phase 3. | Captured |
 | Build a Next.js agent lab dashboard showing agents, reasoning, messages, and citations in real time. | UX Requirements, Technology Stack. | Captured |
@@ -199,6 +203,136 @@ Key SDK behaviors to rely on:
 - Parallel subagent calls are supported: the improvement orchestrator can launch all path agents in one `Agent` tool call batch.
 - Sessions can be resumed with `resume=session_id` across script restarts.
 - Hooks (`PostToolUse`) on the root session provide a global audit trail of all tool calls across all agents.
+
+### Dynamic Recursive Delegation Model
+
+The MVP starts with a named set of core agents, but the runtime model should support **recursive specialist delegation** inside an orchestrator-first control plane.
+
+This means:
+
+- The root orchestrator remains the global authority for budget, safety, checkpoints, and final acceptance.
+- Any agent explicitly granted spawn permissions may create narrower child specialists for well-scoped subproblems.
+- Child specialists may themselves spawn grandchildren if the subproblem still requires decomposition and policy limits allow it.
+- Delegation is driven by task structure and capability matching, not randomness.
+
+The desired operating pattern is:
+
+```text
+Root Orchestrator
+  -> Specialist Agent
+     -> Subspecialist Agent
+        -> Micro-specialist Agent
+```
+
+Examples:
+
+- The Environment Detective may spawn one dependency-forensics child and one simulator-compatibility child.
+- The Baseline Implementation Agent may spawn a data-pipeline child and a training-loop child.
+- The Improvement Orchestrator may spawn a path agent, and that path agent may spawn a focused hyperparameter-search child and a failure-analysis child.
+
+The product should treat this as controlled decomposition, not open-ended agent proliferation. Every spawned child must have:
+
+- A narrow objective.
+- A bounded write scope.
+- An explicit input contract.
+- An explicit output schema.
+- A parent responsible for integrating its result.
+
+### Agent Registry And Capability Model
+
+ReproLab should not rely only on a fixed hard-coded list of agent names. It should maintain an **agent registry** that describes what each specialist can do and when it may be used.
+
+Each registry entry should define:
+
+- `agent_id`
+- `role`
+- `description`
+- `capabilities`
+- `allowed_tools`
+- `spawn_permissions`
+- `max_spawn_depth`
+- `max_fanout`
+- `input_schema`
+- `output_schema`
+- `write_scope`
+- `read_scope`
+- `escalation_rules`
+
+Conceptually:
+
+```json
+{
+  "agent_id": "dependency-forensics",
+  "role": "specialist",
+  "capabilities": [
+    "requirements_conflict_resolution",
+    "python_package_version_recovery",
+    "cuda_pytorch_compatibility"
+  ],
+  "allowed_tools": ["Read", "Bash", "WebSearch"],
+  "spawn_permissions": false,
+  "max_spawn_depth": 0,
+  "max_fanout": 0,
+  "read_scope": ["repo_files", "github_issues", "environment_spec"],
+  "write_scope": ["candidate_dependency_report"],
+  "escalation_rules": ["requires_human_for_paid_compute"]
+}
+```
+
+Routing should be capability-driven:
+
+- The orchestrator classifies the current task.
+- It queries the registry for the best specialist match.
+- It passes only the scoped context that specialist needs.
+- If the specialist determines the task still contains separable subproblems, it may request or perform child delegation subject to policy.
+
+The fixed agent list in the MVP remains useful as the initial registry population. The architecture should describe those named agents as the first registered specialists, not the permanent limit of the system.
+
+### Spawn Policy And Recursive Delegation Rules
+
+Delegation must be policy-driven so the system scales without becoming chaotic.
+
+An agent may spawn children only when at least one of the following is true:
+
+- The task contains two or more independent subproblems with different required capabilities.
+- The task mixes exploration and execution and benefits from splitting those concerns.
+- The expected context size would otherwise exceed the agent's effective working window.
+- The parent needs competing analyses to compare alternatives under time bounds.
+- The parent has reached a failure-analysis branch that requires separate diagnosis before continuing.
+
+An agent must not spawn a child when:
+
+- The task is short enough to finish directly.
+- The child would duplicate an already-running or already-completed task.
+- The expected gain is smaller than the coordination overhead.
+- The child would need broader permissions than the parent is allowed to delegate.
+
+Default guardrails:
+
+- Maximum recursive depth in MVP: `3` beyond the root orchestrator.
+- Maximum fan-out per spawning event in MVP: `3`.
+- Maximum concurrent improvement paths in MVP: `3`.
+- Each child receives its own timeout, token budget, and artifact budget.
+- Parent agents must checkpoint before and after spawning children.
+
+Stopping and escalation rules:
+
+- If a child fails twice with the same root cause, the parent escalates rather than re-spawning clones.
+- If two sibling children produce materially conflicting conclusions, the parent must synthesize or escalate; it must not silently pick one.
+- If the estimated budget, runtime, or risk exceeds policy, the request returns to the root orchestrator for approval.
+- If the parent cannot summarize what it needs from a child in a structured task brief, spawning is disallowed until the task is clarified.
+
+Each spawned child must receive a structured brief containing:
+
+- Parent agent ID.
+- Delegation depth.
+- Goal.
+- Non-goals.
+- Allowed tools.
+- Read scope.
+- Write scope.
+- Expected artifact outputs.
+- Termination condition.
 
 ## Demo Papers
 
@@ -878,6 +1012,82 @@ During the improvement phase, path agents run concurrently:
 - All updates to shared ledgers (assumptions, experiments, decisions) go through the orchestrator's append API.
 - The orchestrator collects all path agent results before triggering Gate 3 verification.
 
+### Recursive Specialist Delegation
+
+The same coordination model should extend beyond a single parent -> child layer.
+
+Rules for multi-level delegation:
+
+- Every child has exactly one parent agent.
+- A child never reports directly to sibling agents; it reports back to its parent.
+- A parent is responsible for translating child output into shared state updates or additional delegations.
+- Grandchildren remain invisible to unrelated branches unless their parent or the orchestrator publishes the relevant result to shared state.
+- The root orchestrator remains the final arbiter for cross-branch prioritization, budget reallocation, and safety overrides.
+
+This preserves clean ownership:
+
+```text
+Root Orchestrator
+  -> Improvement Path Agent A
+     -> Failure Analysis Child
+     -> Hyperparameter Search Child
+
+  -> Improvement Path Agent B
+     -> Data Augmentation Child
+```
+
+In this model, Path Agent A can use its own children freely, but it cannot directly command Path Agent B or B's children. Cross-branch coordination still flows through the orchestrator.
+
+### Shared State And Blackboard Model
+
+ReproLab should use an **orchestrator-owned blackboard** even before moving to a future self-selecting blackboard architecture.
+
+The blackboard is not a free-for-all message bus. It is a structured shared state layer that the orchestrator governs.
+
+It should contain:
+
+- Task records.
+- Delegation tree metadata.
+- Artifact indexes.
+- Assumption ledger entries.
+- Experiment ledger entries.
+- Decision log entries.
+- Verification statuses.
+- Citations and provenance pointers.
+- Context-variable publication events.
+
+Conceptually, every meaningful agent output is published as a typed record:
+
+```json
+{
+  "record_type": "task_result",
+  "task_id": "task_042",
+  "parent_task_id": "task_017",
+  "agent_id": "failure-analysis-child",
+  "status": "completed",
+  "artifacts": ["runs/improvements/path_2/failure_report.json"],
+  "structured_outputs": {
+    "root_causes": ["reward collapse after epoch 9"],
+    "recommended_next_action": "reduce entropy coefficient"
+  },
+  "citations": ["src_011", "src_045"],
+  "published_at": "2026-05-09T12:34:56Z"
+}
+```
+
+The blackboard should support multi-level delegation by making state queryable at three scopes:
+
+- `private_to_parent`: working notes and raw child outputs visible only to the parent and orchestrator.
+- `branch_shared`: outputs visible to agents within the same branch.
+- `global_verified`: outputs promoted by the parent or orchestrator for system-wide reuse.
+
+Promotion rules matter:
+
+- Raw child output does not automatically become global context.
+- Parents must summarize and promote only the parts worth sharing.
+- Verified baseline artifacts and accepted decisions become `global_verified`.
+- Speculative, failed, or contradictory findings can remain branch-local until resolved.
+
 ### Progressive Context Enrichment
 
 As agents complete, their structured outputs are added back into the RLM Context REPL as new variables. This means downstream agents have access to the full enriched context built by upstream agents.
@@ -939,16 +1149,16 @@ The orchestrator uses `structured_outputs` to update shared state and the REPL. 
 
 ### Production Evolution: Blackboard Pattern
 
-For the hackathon MVP, the orchestrator-mediated pattern is sufficient — the pipeline is well-defined and the number of agents is small.
+For the hackathon MVP, ReproLab should already use an **orchestrator-owned blackboard** for structured shared state, delegation metadata, and scoped result publication.
 
-In production (Phase 3+), the improvement phase could evolve to a **blackboard architecture** inspired by [bMAS](https://arxiv.org/abs/2510.01285):
+In production (Phase 3+), this can evolve toward a more autonomous blackboard architecture inspired by [bMAS](https://arxiv.org/abs/2510.01285):
 
-- A shared blackboard replaces orchestrator-assigned tasks.
-- Improvement agents monitor the blackboard and **self-select** tasks based on their capabilities.
-- The orchestrator becomes a lightweight coordinator rather than a rigid controller.
-- This scales better when N improvement agents is dynamic and large.
+- The orchestrator still enforces policy, safety, and budget.
+- More agent types may monitor the blackboard for eligible tasks based on declared capabilities.
+- Self-selection can be allowed for low-risk tasks inside policy boundaries.
+- High-risk or high-cost tasks still require orchestrator approval.
 
-The blackboard pattern eliminates the bottleneck of a single orchestrator needing to understand every agent's capabilities and assign work accordingly. Agents volunteer based on what they can contribute.
+The long-term goal is not to remove the orchestrator, but to reduce assignment bottlenecks while keeping central control over trust, cost, and reproducibility.
 
 ## Context Management
 
@@ -1194,6 +1404,34 @@ Multiple agents run concurrently during the improvement phase. To prevent confli
 - All updates to shared ledgers go through the orchestrator's append API, not direct file writes.
 - The canonical baseline directory `runs/baseline/` becomes read-only after Gate 2 verification passes.
 - The orchestrator serializes ledger writes even when path agents run in parallel.
+- Child and grandchild agents may write raw working outputs only inside their parent-assigned branch workspace.
+- Promotion from raw branch output to blackboard-visible shared state happens only through the parent agent or orchestrator.
+- Every blackboard write must include `task_id`, `parent_task_id`, `agent_id`, `scope`, and citation metadata.
+- Conflicting writes to the same logical object create a new versioned record; they do not overwrite prior records in place.
+
+#### Delegation Tree Tracking
+
+The system should persist the full delegation tree for every run.
+
+For each task node, store:
+
+- `task_id`
+- `parent_task_id`
+- `root_run_id`
+- `agent_id`
+- `delegation_depth`
+- `status`
+- `assigned_budget`
+- `assigned_timeout`
+- `write_scope`
+- `output_record_ids`
+
+This gives the dashboard and audit layer a first-class model of:
+
+- Which agent spawned which child.
+- Which branch produced each artifact or conclusion.
+- Where a failure originated.
+- How deep the system delegated before arriving at a result.
 
 ### Research Context Index
 
