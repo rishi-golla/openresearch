@@ -2481,27 +2481,27 @@ Mitigation:
 Resolved questions are marked with their decision.
 
 1. ~~What is the first demo paper?~~ **Resolved: PPO (CartPole-v1) and MixMatch (CIFAR-10). See Demo Papers section.**
-2. What is the maximum local runtime allowed for MVP? (Suggested starting point: 30 minutes per run.)
-3. What dataset size should require user approval? (Suggested: 2 GB for MVP.)
+2. ~~What is the maximum local runtime allowed for MVP?~~ **Resolved: 30 minutes per run.**
+3. ~~What dataset size should require user approval?~~ **Resolved: 2 GB for MVP.**
 4. ~~What GPU cost threshold should require user approval?~~ **Resolved: Not applicable for hackathon; local CPU only.**
 5. ~~Should the product support only papers with public datasets at first?~~ **Resolved: Yes. Both demo papers use public datasets.**
-6. Should initial improvement paths always be three, or user-configurable? (Suggested: hardcode 3 for hackathon.)
+6. ~~Should initial improvement paths always be three, or user-configurable?~~ **Resolved: Hardcode 3 for hackathon.**
 7. ~~Should verifier agents use a voting system, supervisor override, or strict veto power?~~ **Resolved: Supervisor has full override authority. No voting. All verifier findings are advisory. Supervisor decision is final and must include recorded reasoning. See Supervisor Verification Agent section.**
 8. ~~What confidence threshold is required before labeling a result verified?~~ **Resolved: Dynamic — verifier agents assess the complexity, risk, and evidence quality of each item and set the threshold accordingly. No fixed number. See Dynamic Confidence Threshold section.**
 9. ~~Should the system prioritize exact reproduction or fast partial reproduction for demo?~~ **Resolved: Fast partial reproduction with clearly labeled reduced runs.**
 10. ~~How much of the UI should be built for the hackathon versus generated reports?~~ **Resolved: Full Next.js agent lab dashboard — real-time agent topology, reasoning streams, inter-agent messages, citation explorer, pipeline progress, and data panels. See UX Requirements section.**
 11. ~~Which context backend should the MVP use?~~ **Resolved: Two-layer strategy — RLM Context REPL as primary exploration (programmatic, recursive), Chroma Semantic Index as fallback and fuzzy discovery. SQLite for metadata. RLM based on [arXiv:2512.24601](https://arxiv.org/abs/2512.24601).**
-12. How deep should field history go for MVP: paper only, 1-hop citation graph, or 2-hop citation graph? (Suggested: 1-hop, hand-curated `field_context.md` for the two demo papers.)
+12. ~~How deep should field history go for MVP?~~ **Resolved: 1-hop citation graph, hand-curated `field_context.md` for the two demo papers.**
 13. ~~Which sources should count as primary enough to resolve an ambiguity without human approval?~~ **Resolved: Sources at trust levels 1-4 (paper, official repo tag, official main branch, author comments) can resolve ambiguities without human approval. Levels 5-7 require verification review. Levels 8-10 require human approval. Agents also use `web_search()` and `notebook_query()` (Google NotebookLM) to find additional evidence for ambiguity resolution.**
 14. ~~Should retrieval citations be required for every agent decision or only high-impact decisions?~~ **Resolved: Every decision. Citations are mandatory for all agent decisions, not just high-impact ones. Uncited decisions are flagged as warnings. See Mandatory Citation Policy section.**
 15. ~~What papers should be included in the internal ReproLab benchmark suite?~~ **Resolved: PPO and MixMatch are the first two. Expand in Phase 2.**
 16. What sandbox network policy should be used by default during build and run stages? (Suggested: allow network during build, block during run except approved dataset downloads.)
 17. ~~Is the 7-level source-of-truth priority defined in Paper And Repository Contradiction Handling approved by the team, or does it need adjustment?~~ **Resolved: Expanded to 10 levels. Added: level 5 (papers cited as methodological basis), level 7 (later papers that reproduce/cite), level 9 (field conventions and benchmark standards). See Paper And Repository Contradiction Handling section.**
-18. What minimum seed count is required before calling an improvement verified in production? (Suggested: 3 seeds for production; 1 seed clearly labeled for hackathon.)
-19. What license states should block work versus require user approval?
-20. What resource limits should local Docker sandboxes enforce by default? (Suggested: 4 CPU, 8 GB RAM, 20 GB disk, 30-minute wall-clock timeout.)
+18. ~~What minimum seed count is required before calling an improvement verified in production?~~ **Resolved: 1 seed for hackathon (clearly labeled), 3 seeds for production.**
+19. ~~What license states should block work versus require user approval?~~ **Resolved: Deferred to production. MVP ignores licensing — all demo papers use public datasets and open-source code. Phase 4 should add license scanning for commercial use cases.**
+20. ~~What resource limits should local Docker sandboxes enforce by default?~~ **Resolved: 4 CPU, 8 GB RAM, 20 GB disk, 30-minute wall-clock timeout.**
 21. Should the Knowledge Graph (Graphify) be MVP or Phase 2? (Decision: Phase 2 — demo papers have small repos; Graphify pays off with larger codebases.)
-22. At what scale of improvement agents should the system switch from orchestrator-mediated to blackboard-based coordination? (Suggested: blackboard for N > 5 concurrent improvement agents.)
+22. ~~At what scale of improvement agents should the system switch from orchestrator-mediated to blackboard-based coordination?~~ **Resolved: Blackboard for N > 5 concurrent improvement agents. MVP uses orchestrator with 3 fixed paths.**
 23. ~~Should progressive context enrichment be eager (add all agent outputs to REPL immediately) or lazy (add only when a downstream agent requests it)?~~ **Resolved: Eager. All agent outputs are immediately added as REPL variables when the agent completes. Simpler, and data is small enough for MVP. Lazy loading can be revisited at production scale.**
 
 ## Recommended MVP Positioning
