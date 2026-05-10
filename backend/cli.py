@@ -317,6 +317,10 @@ _REPRODUCE_DEFAULTS = {
     "sandbox_platform": None,
     "sandbox_memory": None,
     "sandbox_cpus": None,
+    "seed": None,
+    "attempt_id": None,
+    "run_group_id": None,
+    "blacklist": None,
 }
 
 
@@ -404,6 +408,7 @@ def cmd_reproduce(args: argparse.Namespace) -> int:
 
     # --- Phase 2: Agent Pipeline ---
     user_hints = [h.strip() for h in args.hints.split(",")] if args.hints else None
+    blacklist_terms = _blacklist_entries_from_arg(args.blacklist)
     from backend.agents.execution import (
         ExecutionProfile,
         resolve_sandbox_mode,
@@ -433,6 +438,10 @@ def cmd_reproduce(args: argparse.Namespace) -> int:
             n_improvement_paths=args.n_paths,
             execution_profile=execution_profile,
             sandbox_mode=sandbox_mode,
+            seed=args.seed,
+            attempt_id=args.attempt_id,
+            run_group_id=args.run_group_id,
+            blacklist_terms=blacklist_terms,
         )
     else:
         from backend.agents.pipeline import run_pipeline_sdk
@@ -446,6 +455,10 @@ def cmd_reproduce(args: argparse.Namespace) -> int:
             n_improvement_paths=args.n_paths,
             execution_profile=execution_profile,
             sandbox_mode=sandbox_mode,
+            seed=args.seed,
+            attempt_id=args.attempt_id,
+            run_group_id=args.run_group_id,
+            blacklist_terms=blacklist_terms,
         ))
 
     # Print final summary
@@ -590,7 +603,34 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Docker CPU limit override.",
     )
+    reproduce.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed to pass through prompts, state, and generated experiment configs.",
+    )
+    reproduce.add_argument(
+        "--attempt-id",
+        default=None,
+        help="Stable identifier for one seeded pipeline attempt.",
+    )
+    reproduce.add_argument(
+        "--run-group-id",
+        default=None,
+        help="Identifier shared by multiple seeded attempts.",
+    )
+    reproduce.add_argument(
+        "--blacklist",
+        default=None,
+        help=(
+            "Comma-separated blocked URLs/terms, or a path to a newline-delimited "
+            "PaperBench blacklist file."
+        ),
+    )
     reproduce.set_defaults(func=cmd_reproduce)
+
+    from backend.cli_paperbench import add_paperbench_subparser
+    add_paperbench_subparser(sub)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
@@ -610,6 +650,19 @@ def _source_from_cli(raw: str, source_kind: str):
     if _ARXIV_RE.search(raw.strip()):
         return ArxivId(arxiv_id=raw)
     return DoiRef(doi=raw)
+
+
+def _blacklist_entries_from_arg(raw: str | None) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    candidate = Path(raw).expanduser()
+    if candidate.exists() and candidate.is_file():
+        return tuple(
+            line.strip()
+            for line in candidate.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 if __name__ == "__main__":

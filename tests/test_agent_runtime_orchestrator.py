@@ -7,7 +7,13 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from backend.agents.orchestrator import ReproLabOrchestrator
-from backend.agents.runtime.base import AgentRuntimeSpec, ProviderName, StreamEvent, StreamText, StreamUsage
+from backend.agents.runtime.base import (
+    AgentRuntimeSpec,
+    ProviderName,
+    StreamEvent,
+    StreamText,
+    StreamUsage,
+)
 
 
 class FakeRuntime:
@@ -69,9 +75,14 @@ def test_orchestrator_builds_provider_specific_runtime_spec(tmp_path: Path) -> N
 
 
 def test_orchestrator_does_not_cap_heavy_agents_by_default(tmp_path: Path) -> None:
+    """Regression: capping at 30 turns for heavy agents (and 15 for normal
+    agents) caused the SDK to abort PaperBench-class runs at turn 16. We
+    now rely on command_timeout_seconds + the agent's submit-when-done
+    contract instead of a per-agent turn count."""
+
     runtime = FakeOpenAiRuntime()
     orchestrator = ReproLabOrchestrator(
-        "prj_uncapped",
+        "prj_capped",
         tmp_path,
         runtime=runtime,
     )
@@ -86,6 +97,38 @@ def test_orchestrator_does_not_cap_heavy_agents_by_default(tmp_path: Path) -> No
 
     assert runtime.agent is not None
     assert runtime.agent.max_turns is None
+
+
+def test_orchestrator_propagates_run_metadata_and_guard(tmp_path: Path) -> None:
+    runtime = FakeOpenAiRuntime()
+    orchestrator = ReproLabOrchestrator(
+        "prj_guarded",
+        tmp_path,
+        runtime=runtime,
+        seed=123,
+        attempt_id="attempt-a",
+        run_group_id="group-a",
+        blacklist_terms=("https://github.com/BartekCupial/finetuning-RL-as-CL",),
+    )
+
+    asyncio.run(
+        orchestrator._invoke_agent(
+            "paper-understanding",
+            "Analyze.",
+            cwd=tmp_path / "work",
+            max_turns=6,
+        )
+    )
+
+    assert runtime.agent is not None
+    # max_tool_calls_per_agent is uncapped by default for the same reason
+    # as max_turns_per_agent — see test_execution_modes.py.
+    assert runtime.agent.guard.max_tool_calls is None
+    assert runtime.agent.guard.find_blocked_term(
+        "git clone https://github.com/BartekCupial/finetuning-RL-as-CL.git"
+    )
+    assert "Use random seed 123" in runtime.user_input
+    assert "attempt_id=attempt-a" in runtime.user_input
 
 
 def test_orchestrator_routes_supervisor_to_verification_runtime(tmp_path: Path) -> None:

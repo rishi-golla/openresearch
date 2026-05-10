@@ -28,6 +28,8 @@ from backend.agents.runtime import (
     AgentRuntime,
     AgentRuntimeSpec,
     ProviderName,
+    RuntimeGuard,
+    RuntimeGuardViolation,
     StreamText,
     StreamToolCall,
     StreamUsage,
@@ -122,6 +124,10 @@ class PipelineState:
     hermes_step_reports: dict[str, list[HermesAuditReport]] = field(default_factory=dict)
     hermes_checkpoint_reports: dict[str, list[HermesAuditReport]] = field(default_factory=dict)
     hermes_interventions: list[dict[str, Any]] = field(default_factory=list)
+    seed: int | None = None
+    attempt_id: str | None = None
+    run_group_id: str | None = None
+    blacklist_terms: list[str] = field(default_factory=list)
 
     def save_checkpoint(self, runs_root: Path) -> Path:
         """Persist pipeline state to disk for crash-resume."""
@@ -133,6 +139,10 @@ class PipelineState:
             "stage": self.stage.value,
             "assumption_ledger": self.assumption_ledger,
             "decision_log": self.decision_log,
+            "seed": self.seed,
+            "attempt_id": self.attempt_id,
+            "run_group_id": self.run_group_id,
+            "blacklist_terms": self.blacklist_terms,
         }
         if self.paper_claim_map:
             data["paper_claim_map"] = self.paper_claim_map.model_dump()
@@ -183,6 +193,10 @@ class PipelineState:
         state.stage = PipelineStage(data["stage"])
         state.assumption_ledger = data.get("assumption_ledger", [])
         state.decision_log = data.get("decision_log", [])
+        state.seed = data.get("seed")
+        state.attempt_id = data.get("attempt_id")
+        state.run_group_id = data.get("run_group_id")
+        state.blacklist_terms = data.get("blacklist_terms", [])
         if "paper_claim_map" in data:
             state.paper_claim_map = PaperClaimMap(**data["paper_claim_map"])
         if "environment_spec" in data:
@@ -248,6 +262,10 @@ class ReproLabOrchestrator:
         execution_profile: ExecutionProfile | None = None,
         sandbox_mode: SandboxMode | str = SandboxMode.docker,
         hermes_audit_service: HermesAuditService | None = None,
+        seed: int | None = None,
+        attempt_id: str | None = None,
+        run_group_id: str | None = None,
+        blacklist_terms: tuple[str, ...] = (),
     ) -> None:
         self.project_id = project_id
         self.runs_root = Path(runs_root)
@@ -263,6 +281,10 @@ class ReproLabOrchestrator:
         self.heavy_agent_max_turns = self.execution_profile.heavy_agent_max_turns
         self.permission_mode = permission_mode
         self.sandbox_mode = resolve_sandbox_mode(sandbox_mode, pipeline_mode="sdk")
+        self.seed = seed
+        self.attempt_id = attempt_id
+        self.run_group_id = run_group_id
+        self.blacklist_terms = tuple(term.strip() for term in blacklist_terms if term.strip())
         if self.sandbox_mode is SandboxMode.simulate:
             raise ValueError(
                 "SDK pipeline does not support simulated experiment execution. "
@@ -306,8 +328,12 @@ class ReproLabOrchestrator:
     ) -> AgentRuntimeSpec:
         spec = AGENT_REGISTRY[agent_id]
         provider = runtime.provider_name
+        guard = RuntimeGuard(
+            blocked_terms=self.blacklist_terms,
+            max_tool_calls=self.execution_profile.max_tool_calls_per_agent,
+        )
         sub_agents = tuple(
-            sub_spec.to_runtime_spec(provider)
+            replace(sub_spec.to_runtime_spec(provider), guard=guard)
             for sub_id, sub_spec in AGENT_REGISTRY.items()
             if sub_id != agent_id
         )
@@ -318,7 +344,11 @@ class ReproLabOrchestrator:
             working_directory=Path(cwd or self._project_dir),
             sub_agents=sub_agents,
         )
-        return replace(runtime_spec, permission_mode=self.permission_mode)
+        return replace(
+            runtime_spec,
+            permission_mode=self.permission_mode,
+            guard=guard,
+        )
 
     async def _invoke_agent(
         self,
@@ -344,6 +374,7 @@ class ReproLabOrchestrator:
             max_turns=max_turns,
         )
 
+        task_prompt = self._append_run_controls(task_prompt)
         task_prompt = append_structured_output_instruction(
             task_prompt,
             self._OUTPUT_MODELS.get(agent_id),
@@ -358,6 +389,7 @@ class ReproLabOrchestrator:
         success = True
         error_message = ""
         usage: dict[str, Any] = {}
+        tool_call_count = 0
         print(f"  [{agent_id}] starting...", file=sys.stderr, flush=True)
 
         try:
@@ -378,6 +410,15 @@ class ReproLabOrchestrator:
                             flush=True,
                         )
                 elif isinstance(event, StreamToolCall):
+                    tool_call_count += 1
+                    if (
+                        runtime_spec.guard.max_tool_calls is not None
+                        and tool_call_count > runtime_spec.guard.max_tool_calls
+                    ):
+                        raise RuntimeGuardViolation(
+                            f"{agent_id} exceeded tool-call budget "
+                            f"({runtime_spec.guard.max_tool_calls})"
+                        )
                     tool_info = event.tool_name
                     inp = event.tool_input or {}
                     if "file_path" in inp:
@@ -438,6 +479,27 @@ class ReproLabOrchestrator:
             elapsed_seconds=time.time() - t0,
         )
         return result
+
+    def _append_run_controls(self, prompt: str) -> str:
+        controls: list[str] = []
+        if self.seed is not None:
+            controls.append(
+                f"Use random seed {self.seed} for scripts, configs, data splits, and experiments."
+            )
+        if self.attempt_id or self.run_group_id:
+            controls.append(
+                "Run metadata: "
+                f"attempt_id={self.attempt_id or 'unset'}, "
+                f"run_group_id={self.run_group_id or 'unset'}."
+            )
+        if self.blacklist_terms:
+            controls.append(
+                "Do not access, fetch, clone, download, or copy from these blocked resources: "
+                + ", ".join(self.blacklist_terms)
+            )
+        if not controls:
+            return prompt
+        return prompt + "\n\nRuntime controls:\n- " + "\n- ".join(controls)
 
     def _runtime_for_agent(self, agent_id: str) -> AgentRuntime:
         if agent_id == "supervisor-verifier":
@@ -1122,7 +1184,19 @@ class ReproLabOrchestrator:
         if resume:
             state = PipelineState.load_checkpoint(self.runs_root, self.project_id)
         if state is None:
-            state = PipelineState(project_id=self.project_id)
+            state = PipelineState(
+                project_id=self.project_id,
+                seed=self.seed,
+                attempt_id=self.attempt_id,
+                run_group_id=self.run_group_id,
+                blacklist_terms=list(self.blacklist_terms),
+            )
+        else:
+            state.seed = self.seed if self.seed is not None else state.seed
+            state.attempt_id = self.attempt_id or state.attempt_id
+            state.run_group_id = self.run_group_id or state.run_group_id
+            if self.blacklist_terms:
+                state.blacklist_terms = list(self.blacklist_terms)
 
         # Define the pipeline as a sequence of (stage_threshold, step_fn) pairs.
         # Each step only runs if the pipeline hasn't passed that stage yet.
@@ -1170,9 +1244,11 @@ class ReproLabOrchestrator:
             state = await self.run_improvements(
                 state, user_hints=user_hints, n_paths=n_improvement_paths,
             )
+            current_idx = stages_order.index(state.stage)
 
         if current_idx < stages_order.index(PipelineStage.GATE_3_PASSED):
             state = await self.run_gate_3(state)
+            current_idx = stages_order.index(state.stage)
 
         if current_idx < stages_order.index(PipelineStage.RESEARCH_MAP_GENERATED):
             state = await self.generate_research_map(state)

@@ -43,6 +43,7 @@ class ExecutionProfile:
     mode: ExecutionMode
     max_turns_per_agent: int | None
     heavy_agent_max_turns: int | None
+    max_tool_calls_per_agent: int | None
     command_timeout_seconds: int
     sandbox_network_disabled: bool = True
     sandbox_memory_limit: str = "4g"
@@ -68,8 +69,13 @@ class ExecutionProfile:
         if resolved_mode is ExecutionMode.max:
             base = cls(
                 mode=resolved_mode,
+                # No turn cap. The SDK / Claude Code default is 15, which is
+                # far too low for any non-trivial paper. We rely on
+                # command_timeout_seconds + the agent's submit-when-done
+                # contract to bound runs instead of a hard turn count.
                 max_turns_per_agent=None,
                 heavy_agent_max_turns=None,
+                max_tool_calls_per_agent=None,
                 command_timeout_seconds=7200,
                 sandbox_network_disabled=True,
                 sandbox_memory_limit="12g" if resolved_gpu_mode is GpuMode.max else "8g",
@@ -80,8 +86,12 @@ class ExecutionProfile:
         else:
             base = cls(
                 mode=resolved_mode,
+                # See `max` branch above: we deliberately do NOT cap turns or
+                # tool calls per agent. The SDK default of 15 is too low for
+                # PaperBench-class papers and silently aborts runs at turn 16.
                 max_turns_per_agent=None,
                 heavy_agent_max_turns=None,
+                max_tool_calls_per_agent=None,
                 command_timeout_seconds=3600,
                 sandbox_network_disabled=True,
                 sandbox_memory_limit=(
@@ -102,6 +112,7 @@ class ExecutionProfile:
             mode=base.mode,
             max_turns_per_agent=base.max_turns_per_agent,
             heavy_agent_max_turns=base.heavy_agent_max_turns,
+            max_tool_calls_per_agent=base.max_tool_calls_per_agent,
             command_timeout_seconds=(
                 command_timeout_seconds
                 if command_timeout_seconds is not None
