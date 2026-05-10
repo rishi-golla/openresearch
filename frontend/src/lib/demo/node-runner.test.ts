@@ -21,8 +21,10 @@ describe("node-runner uploaded paper helpers", () => {
       "prj_1234567890abcdef",
       "sdk",
       "anthropic",
+      "openai",
       "max",
       "docker",
+      "prefer",
       {
         sourcePath: "C:\\runs\\.lab_uploads\\paper.pdf",
         fileName: "paper.pdf"
@@ -33,12 +35,35 @@ describe("node-runner uploaded paper helpers", () => {
     expect(script).toContain("exit_code = cmd_reproduce");
     expect(script).toContain('write_status("failed", error=f"Pipeline exited with status {exit_code}"');
     expect(script).toContain('provider=llm_provider if "sdk" == "sdk" else None');
+    expect(script).toContain('verification_provider=verification_provider if "sdk" == "sdk" else None');
     expect(script).toContain('execution_mode=execution_mode');
     expect(script).toContain('sandbox=sandbox_mode');
+    expect(script).toContain('gpu_mode=gpu_mode');
     expect(script).toContain('"executionMode": execution_mode');
     expect(script).toContain('"sandboxMode": sandbox_mode');
+    expect(script).toContain('"gpuMode": gpu_mode');
     expect(script).toContain('source_kind="pdf_path"');
-    expect(script).toContain("C:\\runs\\.lab_uploads\\paper.pdf");
+    expect(script).toContain('uploaded_paper = Path("C:\\\\runs\\\\.lab_uploads\\\\paper.pdf").resolve()');
     expect(script).not.toContain("workspace = json.loads");
+  });
+
+  it("escapes uploaded paper paths and names before embedding them in python", () => {
+    const script = __test__.buildPythonScript(
+      "prj_1234567890abcdef",
+      "sdk",
+      "anthropic",
+      "anthropic",
+      "efficient",
+      "auto",
+      "auto",
+      {
+        sourcePath: "C:\\runs\\.lab_uploads\\evil'''paper.pdf",
+        fileName: "evil'''paper.pdf"
+      }
+    );
+
+    expect(script).toContain('uploaded_paper = Path("C:\\\\runs\\\\.lab_uploads\\\\evil\'\'\'paper.pdf").resolve()');
+    expect(script).toContain('uploaded_file_name = "evil\'\'\'paper.pdf"');
+    expect(script).not.toContain('r\'\'\'evil\'\'\'paper.pdf\'\'\'');
   });
 });

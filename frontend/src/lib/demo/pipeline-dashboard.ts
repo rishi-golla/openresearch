@@ -8,6 +8,7 @@ import type {
 } from "@/lib/events/contract";
 import type {
   DemoExecutionMode,
+  DemoGpuMode,
   DemoProvider,
   DemoSandboxMode
 } from "./demo-run-types";
@@ -153,8 +154,10 @@ export interface LiveDemoMeta {
   sourceKind: "workspace_fixture" | "uploaded_pdf";
   runMode: "offline" | "sdk";
   llmProvider?: DemoProvider;
+  verificationProvider?: DemoProvider;
   executionMode?: DemoExecutionMode;
   sandboxMode?: DemoSandboxMode;
+  gpuMode?: DemoGpuMode;
   sourceLabel: string;
   sourceNote: string;
 }
@@ -170,8 +173,10 @@ export interface LiveDemoPayload extends LiveDemoMeta {
     improvementCount: number;
     runModeLabel: string;
     llmProvider?: DemoProvider;
+    verificationProvider?: DemoProvider;
     executionMode?: DemoExecutionMode;
     sandboxMode?: DemoSandboxMode;
+    gpuMode?: DemoGpuMode;
     sourceLabel: string;
   };
 }
@@ -194,6 +199,19 @@ function sandboxLabel(mode?: DemoSandboxMode): string {
     return "Docker sandbox";
   }
   return "Auto Docker sandbox";
+}
+
+function gpuLabel(mode?: DemoGpuMode): string {
+  switch (mode) {
+    case "off":
+      return "CPU only";
+    case "prefer":
+      return "Prefer GPU";
+    case "max":
+      return "Max GPU";
+    default:
+      return "Auto GPU";
+  }
 }
 
 function toStatusTone(status?: GateStatus): ProgressStatus {
@@ -482,7 +500,8 @@ function buildInitialSnapshot(
           `Implementation mode: ${state.baseline_result?.mode ?? "pending"}`,
           `Applied assumptions: ${(state.baseline_result?.assumptions_applied ?? []).join(", ") || "Pending"}`,
           `Run mode: ${runModeLabel(meta.runMode, meta.llmProvider)}`,
-          `Execution: ${meta.executionMode ?? "efficient"} / ${sandboxLabel(meta.sandboxMode)}`,
+          `Execution: ${meta.executionMode ?? "efficient"} / ${sandboxLabel(meta.sandboxMode)} / ${gpuLabel(meta.gpuMode)}`,
+          `Verifier: ${meta.verificationProvider ? runModeLabel("sdk", meta.verificationProvider) : "Same provider as builder"}`,
           meta.sourceNote
         ]
       },
@@ -1095,8 +1114,10 @@ export function buildLiveDemoDashboard(
       improvementCount: pathResults.length,
       runModeLabel: runModeLabel(meta.runMode, meta.llmProvider),
       llmProvider: meta.llmProvider,
+      verificationProvider: meta.verificationProvider,
       executionMode: meta.executionMode,
       sandboxMode: meta.sandboxMode,
+      gpuMode: meta.gpuMode,
       sourceLabel: meta.sourceLabel
     }
   };

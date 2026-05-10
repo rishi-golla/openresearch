@@ -36,6 +36,8 @@ describe("POST /api/demo", () => {
     const { POST } = await import("./route");
     const formData = new FormData();
     formData.set("mode", "sdk");
+    formData.set("provider", "anthropic");
+    formData.set("verificationProvider", "openai");
     formData.set(
       "paper",
       new File([new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d])], "paper.pdf", {
@@ -54,7 +56,9 @@ describe("POST /api/demo", () => {
     expect(startDemoRun).toHaveBeenCalledWith("sdk", "anthropic", "efficient", "auto", {
       uploadedPaper: expect.objectContaining({
         fileName: "paper.pdf"
-      })
+      }),
+      verificationProvider: "openai",
+      gpuMode: "auto"
     });
   });
 

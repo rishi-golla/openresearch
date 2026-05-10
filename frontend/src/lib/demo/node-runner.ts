@@ -9,6 +9,7 @@ import { promisify } from "util";
 
 import type {
   DemoExecutionMode,
+  DemoGpuMode,
   DemoProvider,
   DemoRunMode,
   DemoRunStatus,
@@ -51,8 +52,10 @@ interface DemoRunStatusFile {
   outputDir: string;
   runMode: DemoRunMode;
   llmProvider?: DemoProvider;
+  verificationProvider?: DemoProvider;
   executionMode?: DemoExecutionMode;
   sandboxMode?: DemoSandboxMode;
+  gpuMode?: DemoGpuMode;
   status: DemoRunStatus;
   sourceKind?: "workspace_fixture" | "uploaded_pdf";
   sourceLabel?: string;
@@ -76,12 +79,22 @@ interface UploadedPaperLaunchConfig {
 
 interface DemoRunStartOptions {
   uploadedPaper?: UploadedPaperInput;
+  verificationProvider?: DemoProvider;
+  gpuMode?: DemoGpuMode;
 }
 
 const execFileAsync = promisify(execFile);
 
 function repoRoot(): string {
-  return path.resolve(/* turbopackIgnore: true */ process.cwd(), "..");
+  const override = process.env.REPROLAB_REPO_ROOT?.trim();
+  if (override) {
+    return override;
+  }
+  return path.join(process.cwd(), "..");
+}
+
+function pythonStringLiteral(value: string): string {
+  return JSON.stringify(value);
 }
 
 /**
@@ -141,8 +154,10 @@ function buildFixtureMeta(
   outputDir: string,
   runMode: DemoRunMode,
   llmProvider?: DemoProvider,
+  verificationProvider?: DemoProvider,
   executionMode: DemoExecutionMode = "efficient",
-  sandboxMode: DemoSandboxMode = "auto"
+  sandboxMode: DemoSandboxMode = "auto",
+  gpuMode: DemoGpuMode = "auto"
 ): LiveDemoMeta {
   return {
     projectId,
@@ -150,8 +165,10 @@ function buildFixtureMeta(
     sourceKind: "workspace_fixture",
     runMode,
     llmProvider,
+    verificationProvider,
     executionMode,
     sandboxMode,
+    gpuMode,
     sourceLabel: "In-repo PPO workspace fixture",
     sourceNote:
       "The repo currently does not contain a checked-in paper PDF, so this UI demo uses the deterministic PPO workspace fixture that already drives the end-to-end pipeline tests."
@@ -163,8 +180,10 @@ function buildUploadedPaperMeta(
   outputDir: string,
   runMode: DemoRunMode,
   llmProvider: DemoProvider | undefined,
+  verificationProvider: DemoProvider | undefined,
   executionMode: DemoExecutionMode,
   sandboxMode: DemoSandboxMode,
+  gpuMode: DemoGpuMode,
   fileName: string
 ): LiveDemoMeta {
   return {
@@ -173,8 +192,10 @@ function buildUploadedPaperMeta(
     sourceKind: "uploaded_pdf",
     runMode,
     llmProvider,
+    verificationProvider,
     executionMode,
     sandboxMode,
+    gpuMode,
     sourceLabel: fileName,
     sourceNote:
       "This run started from a PDF uploaded directly in the lab. The backend routed it through the repo's paper ingestion pipeline before running reproduction."
@@ -219,8 +240,10 @@ function metaFromStatus(
   status?: Pick<
     DemoRunStatusFile,
     | "llmProvider"
+    | "verificationProvider"
     | "executionMode"
     | "sandboxMode"
+    | "gpuMode"
     | "sourceKind"
     | "sourceLabel"
     | "sourceNote"
@@ -228,6 +251,8 @@ function metaFromStatus(
 ): LiveDemoMeta {
   const executionMode = status?.executionMode ?? "efficient";
   const sandboxMode = status?.sandboxMode ?? "auto";
+  const verificationProvider = status?.verificationProvider;
+  const gpuMode = status?.gpuMode ?? "auto";
 
   if (
     status?.sourceKind === "uploaded_pdf" &&
@@ -239,8 +264,10 @@ function metaFromStatus(
       outputDir,
       runMode,
       llmProvider: status.llmProvider,
+      verificationProvider,
       executionMode,
       sandboxMode,
+      gpuMode,
       sourceKind: "uploaded_pdf",
       sourceLabel: status.sourceLabel,
       sourceNote: status.sourceNote
@@ -252,8 +279,10 @@ function metaFromStatus(
     outputDir,
     runMode,
     status?.llmProvider,
+    verificationProvider,
     executionMode,
-    sandboxMode
+    sandboxMode,
+    gpuMode
   );
 }
 
@@ -264,8 +293,10 @@ async function payloadForProject(
   status?: Pick<
     DemoRunStatusFile,
     | "llmProvider"
+    | "verificationProvider"
     | "executionMode"
     | "sandboxMode"
+    | "gpuMode"
     | "sourceKind"
     | "sourceLabel"
     | "sourceNote"
@@ -284,11 +315,25 @@ function buildPythonScript(
   projectId: string,
   runMode: DemoRunMode,
   llmProvider: DemoProvider,
+  verificationProvider: DemoProvider | undefined,
   executionMode: DemoExecutionMode,
   sandboxMode: DemoSandboxMode,
+  gpuMode: DemoGpuMode,
   uploadedPaper?: UploadedPaperLaunchConfig
 ): string {
+  const projectIdLiteral = pythonStringLiteral(projectId);
+  const runModeLiteral = pythonStringLiteral(runMode);
+  const llmProviderLiteral = pythonStringLiteral(llmProvider);
+  const verificationProviderLiteral =
+    verificationProvider === undefined ? "None" : pythonStringLiteral(verificationProvider);
+  const executionModeLiteral = pythonStringLiteral(executionMode);
+  const sandboxModeLiteral = pythonStringLiteral(sandboxMode);
+  const gpuModeLiteral = pythonStringLiteral(gpuMode);
+  const runsRootLiteral = pythonStringLiteral(runsRoot());
+
   if (uploadedPaper) {
+    const uploadedPaperPathLiteral = pythonStringLiteral(uploadedPaper.sourcePath);
+    const uploadedFileNameLiteral = pythonStringLiteral(uploadedPaper.fileName);
     return `
 import json
 from argparse import Namespace
@@ -298,15 +343,18 @@ from pathlib import Path
 from backend.cli import cmd_reproduce
 from backend.config import get_settings
 
-project_id = r'''${projectId}'''
-llm_provider = r'''${llmProvider}'''
-execution_mode = r'''${executionMode}'''
-sandbox_mode = r'''${sandboxMode}'''
-runs_root = Path(r'''${runsRoot()}''')
+project_id = ${projectIdLiteral}
+llm_provider = ${llmProviderLiteral}
+verification_provider = ${verificationProviderLiteral}
+execution_mode = ${executionModeLiteral}
+sandbox_mode = ${sandboxModeLiteral}
+gpu_mode = ${gpuModeLiteral}
+runs_root = Path(${runsRootLiteral})
 output_dir = (runs_root / project_id).resolve()
 output_dir.mkdir(parents=True, exist_ok=True)
 status_path = output_dir / "demo_status.json"
-uploaded_paper = Path(r'''${uploadedPaper.sourcePath}''').resolve()
+uploaded_paper = Path(${uploadedPaperPathLiteral}).resolve()
+uploaded_file_name = ${uploadedFileNameLiteral}
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -321,18 +369,21 @@ def write_status(status, error=None, completed_at=None):
     payload = {
         "projectId": project_id,
         "outputDir": str(output_dir),
-        "runMode": "${runMode}",
+        "runMode": ${runModeLiteral},
         "executionMode": execution_mode,
         "sandboxMode": sandbox_mode,
+        "gpuMode": gpu_mode,
         "sourceKind": "uploaded_pdf",
-        "sourceLabel": r'''${uploadedPaper.fileName}''',
+        "sourceLabel": uploaded_file_name,
         "sourceNote": "This run started from a PDF uploaded directly in the lab. The backend routed it through the repo's paper ingestion pipeline before running reproduction.",
         "status": status,
         "startedAt": started_at,
         "updatedAt": now(),
     }
-    if "${runMode}" == "sdk":
+    if ${runModeLiteral} == "sdk":
         payload["llmProvider"] = llm_provider
+        if verification_provider is not None:
+            payload["verificationProvider"] = verification_provider
     if existing.get("pid") is not None:
         payload["pid"] = existing["pid"]
     if completed_at:
@@ -349,11 +400,13 @@ try:
         source=str(uploaded_paper),
         source_kind="pdf_path",
         agent="default",
-        mode="${runMode}",
+        mode=${runModeLiteral},
         model=None,
-        provider=llm_provider if "${runMode}" == "sdk" else None,
+        provider=llm_provider if ${runModeLiteral} == "sdk" else None,
+        verification_provider=verification_provider if ${runModeLiteral} == "sdk" else None,
         execution_mode=execution_mode,
         sandbox=sandbox_mode,
+        gpu_mode=gpu_mode,
         command_timeout=None,
         allow_sandbox_network=False,
         sandbox_platform=None,
@@ -374,6 +427,7 @@ except Exception as exc:
 `;
   }
 
+  const workspaceLiteral = pythonStringLiteral(JSON.stringify(DEMO_WORKSPACE));
   return `
 import asyncio
 import json
@@ -383,12 +437,14 @@ from pathlib import Path
 from backend.agents.execution import ExecutionProfile, SandboxMode
 from backend.agents.pipeline import run_pipeline_offline, run_pipeline_sdk
 
-workspace = json.loads(r'''${JSON.stringify(DEMO_WORKSPACE)}''')
-project_id = r'''${projectId}'''
-llm_provider = r'''${llmProvider}'''
-execution_mode = r'''${executionMode}'''
-sandbox_mode = r'''${sandboxMode}'''
-runs_root = Path(r'''${runsRoot()}''')
+workspace = json.loads(${workspaceLiteral})
+project_id = ${projectIdLiteral}
+llm_provider = ${llmProviderLiteral}
+verification_provider = ${verificationProviderLiteral}
+execution_mode = ${executionModeLiteral}
+sandbox_mode = ${sandboxModeLiteral}
+gpu_mode = ${gpuModeLiteral}
+runs_root = Path(${runsRootLiteral})
 output_dir = (runs_root / project_id).resolve()
 output_dir.mkdir(parents=True, exist_ok=True)
 status_path = output_dir / "demo_status.json"
@@ -406,15 +462,18 @@ def write_status(status, error=None, completed_at=None):
     payload = {
         "projectId": project_id,
         "outputDir": str(output_dir),
-        "runMode": "${runMode}",
+        "runMode": ${runModeLiteral},
         "executionMode": execution_mode,
         "sandboxMode": sandbox_mode,
+        "gpuMode": gpu_mode,
         "status": status,
         "startedAt": started_at,
         "updatedAt": now(),
     }
-    if "${runMode}" == "sdk":
+    if ${runModeLiteral} == "sdk":
         payload["llmProvider"] = llm_provider
+        if verification_provider is not None:
+            payload["verificationProvider"] = verification_provider
     if existing.get("pid") is not None:
         payload["pid"] = existing["pid"]
     if completed_at:
@@ -425,15 +484,16 @@ def write_status(status, error=None, completed_at=None):
 
 started_at = now()
 write_status("running")
-execution_profile = ExecutionProfile.from_mode(execution_mode)
+execution_profile = ExecutionProfile.from_mode(execution_mode, gpu_mode=gpu_mode)
 
 try:
-    if "${runMode}" == "sdk":
+    if ${runModeLiteral} == "sdk":
         asyncio.run(run_pipeline_sdk(
             project_id,
             runs_root,
             workspace,
             provider=llm_provider,
+            verification_provider=verification_provider,
             user_hints=["Keep this as a lightweight smoke test"],
             n_improvement_paths=1,
             execution_profile=execution_profile,
@@ -458,7 +518,9 @@ async function latestProjectId(
   runMode?: DemoRunMode,
   llmProvider?: DemoProvider,
   executionMode?: DemoExecutionMode,
-  sandboxMode?: DemoSandboxMode
+  sandboxMode?: DemoSandboxMode,
+  verificationProvider?: DemoProvider,
+  gpuMode?: DemoGpuMode
 ): Promise<string | null> {
   try {
     const entries = await fs.readdir(runsRoot(), { withFileTypes: true });
@@ -479,10 +541,16 @@ async function latestProjectId(
               return null;
             }
           }
-          if (executionMode && status.executionMode !== executionMode) {
+          if (executionMode && (status.executionMode ?? "efficient") !== executionMode) {
             return null;
           }
-          if (sandboxMode && status.sandboxMode !== sandboxMode) {
+          if (sandboxMode && (status.sandboxMode ?? "auto") !== sandboxMode) {
+            return null;
+          }
+          if (verificationProvider && status.verificationProvider !== verificationProvider) {
+            return null;
+          }
+          if (gpuMode && (status.gpuMode ?? "auto") !== gpuMode) {
             return null;
           }
           const timestamp = Date.parse(status.updatedAt || status.startedAt || "");
@@ -507,8 +575,10 @@ async function inferState(projectId: string): Promise<LiveDemoRunState | null> {
   const runMode: DemoRunMode =
     status?.runMode ?? (projectId.startsWith("ui_sdk_") ? "sdk" : "offline");
   const llmProvider = status?.llmProvider ?? providerFromProjectId(projectId);
+  const verificationProvider = status?.verificationProvider;
   const executionMode = status?.executionMode ?? "efficient";
   const sandboxMode = status?.sandboxMode ?? "auto";
+  const gpuMode = status?.gpuMode ?? "auto";
   const log = await readLogTail(projectId);
   const payload = await payloadForProject(projectId, runMode, log, status ?? undefined);
 
@@ -518,8 +588,10 @@ async function inferState(projectId: string): Promise<LiveDemoRunState | null> {
       outputDir: status.outputDir,
       runMode: status.runMode,
       llmProvider,
+      verificationProvider,
       executionMode,
       sandboxMode,
+      gpuMode,
       status: status.status,
       sourceKind: status.sourceKind,
       sourceLabel: status.sourceLabel,
@@ -540,8 +612,10 @@ async function inferState(projectId: string): Promise<LiveDemoRunState | null> {
       outputDir: payload.outputDir,
       runMode,
       llmProvider,
+      verificationProvider,
       executionMode,
       sandboxMode,
+      gpuMode,
       status: "completed",
       sourceKind: payload.sourceKind,
       sourceLabel: payload.sourceLabel,
@@ -555,10 +629,10 @@ async function inferState(projectId: string): Promise<LiveDemoRunState | null> {
 }
 
 function providerFromProjectId(projectId: string): DemoProvider | undefined {
-  if (projectId.startsWith("ui_sdk_openai_demo_")) {
+  if (projectId.startsWith("ui_sdk_openai_")) {
     return "openai";
   }
-  if (projectId.startsWith("ui_sdk_anthropic_demo_") || projectId.startsWith("ui_sdk_demo_")) {
+  if (projectId.startsWith("ui_sdk_anthropic_") || projectId.startsWith("ui_sdk_demo_")) {
     return "anthropic";
   }
   return undefined;
@@ -568,13 +642,17 @@ async function currentRunningRun(
   runMode: DemoRunMode,
   llmProvider?: DemoProvider,
   executionMode?: DemoExecutionMode,
-  sandboxMode?: DemoSandboxMode
+  sandboxMode?: DemoSandboxMode,
+  verificationProvider?: DemoProvider,
+  gpuMode?: DemoGpuMode
 ): Promise<LiveDemoRunState | null> {
   const projectId = await latestProjectId(
     runMode,
     llmProvider,
     executionMode,
-    sandboxMode
+    sandboxMode,
+    verificationProvider,
+    gpuMode
   );
   if (!projectId) {
     return null;
@@ -622,11 +700,16 @@ export async function startDemoRun(
   sandboxMode: DemoSandboxMode = "auto",
   options?: DemoRunStartOptions
 ): Promise<LiveDemoRunState> {
+  const verificationProvider =
+    runMode === "sdk" ? options?.verificationProvider : undefined;
+  const gpuMode = options?.gpuMode ?? "auto";
   const existing = await currentRunningRun(
     runMode,
     runMode === "sdk" ? llmProvider : undefined,
     executionMode,
-    sandboxMode
+    sandboxMode,
+    verificationProvider,
+    gpuMode
   );
   if (existing) {
     return existing;
@@ -638,7 +721,7 @@ export async function startDemoRun(
   const projectId = uploadedPaper
     ? projectIdForUploadedPdfPath(uploadedPaper.sourcePath)
     : runMode === "sdk"
-      ? `ui_sdk_${llmProvider}_demo_${Date.now()}`
+      ? `ui_sdk_${llmProvider}_review_${verificationProvider ?? "same"}_demo_${Date.now()}`
       : `ui_demo_${Date.now()}`;
   const outputDir = runDir(projectId);
   const meta = uploadedPaper
@@ -647,8 +730,10 @@ export async function startDemoRun(
         outputDir,
         runMode,
         runMode === "sdk" ? llmProvider : undefined,
+        verificationProvider,
         executionMode,
         sandboxMode,
+        gpuMode,
         uploadedPaper.fileName
       )
     : buildFixtureMeta(
@@ -656,8 +741,10 @@ export async function startDemoRun(
         outputDir,
         runMode,
         runMode === "sdk" ? llmProvider : undefined,
+        verificationProvider,
         executionMode,
-        sandboxMode
+        sandboxMode,
+        gpuMode
       );
   await fs.mkdir(outputDir, { recursive: true });
   const now = new Date().toISOString();
@@ -666,8 +753,10 @@ export async function startDemoRun(
     outputDir,
     runMode,
     llmProvider: runMode === "sdk" ? llmProvider : undefined,
+    verificationProvider,
     executionMode,
     sandboxMode,
+    gpuMode,
     sourceKind: meta.sourceKind,
     sourceLabel: meta.sourceLabel,
     sourceNote: meta.sourceNote,
@@ -693,8 +782,10 @@ export async function startDemoRun(
           projectId,
           runMode,
           llmProvider,
+          verificationProvider,
           executionMode,
           sandboxMode,
+          gpuMode,
           uploadedPaper ?? undefined
         )
       ]
@@ -705,8 +796,10 @@ export async function startDemoRun(
           projectId,
           runMode,
           llmProvider,
+          verificationProvider,
           executionMode,
           sandboxMode,
+          gpuMode,
           uploadedPaper ?? undefined
         )
       ];
@@ -717,7 +810,9 @@ export async function startDemoRun(
     stdio: ["ignore", stdoutFile.fd, stderrFile.fd],
     env: {
       ...process.env,
-      ...(runMode === "sdk" ? { REPROLAB_LLM_PROVIDER: llmProvider } : {})
+      REPROLAB_GPU_MODE: gpuMode,
+      ...(runMode === "sdk" ? { REPROLAB_LLM_PROVIDER: llmProvider } : {}),
+      ...(verificationProvider ? { REPROLAB_VERIFICATION_PROVIDER: verificationProvider } : {})
     }
   });
 
@@ -726,8 +821,10 @@ export async function startDemoRun(
     outputDir,
     runMode,
     llmProvider: runMode === "sdk" ? llmProvider : undefined,
+    verificationProvider,
     executionMode,
     sandboxMode,
+    gpuMode,
     sourceKind: meta.sourceKind,
     sourceLabel: meta.sourceLabel,
     sourceNote: meta.sourceNote,
@@ -746,8 +843,10 @@ export async function startDemoRun(
     outputDir,
     runMode,
     llmProvider: runMode === "sdk" ? llmProvider : undefined,
+    verificationProvider,
     executionMode,
     sandboxMode,
+    gpuMode,
     sourceKind: meta.sourceKind,
     sourceLabel: meta.sourceLabel,
     sourceNote: meta.sourceNote,
@@ -763,10 +862,20 @@ export async function stopDemoRun(
   projectId?: string,
   llmProvider?: DemoProvider,
   executionMode?: DemoExecutionMode,
-  sandboxMode?: DemoSandboxMode
+  sandboxMode?: DemoSandboxMode,
+  verificationProvider?: DemoProvider,
+  gpuMode?: DemoGpuMode
 ): Promise<LiveDemoRunState | null> {
   const resolvedProjectId =
-    projectId ?? (await latestProjectId(runMode, llmProvider, executionMode, sandboxMode));
+    projectId ??
+    (await latestProjectId(
+      runMode,
+      llmProvider,
+      executionMode,
+      sandboxMode,
+      verificationProvider,
+      gpuMode
+    ));
   if (!resolvedProjectId) {
     return null;
   }
@@ -801,10 +910,20 @@ export async function loadDemoRun(
   runMode?: DemoRunMode,
   llmProvider?: DemoProvider,
   executionMode?: DemoExecutionMode,
-  sandboxMode?: DemoSandboxMode
+  sandboxMode?: DemoSandboxMode,
+  verificationProvider?: DemoProvider,
+  gpuMode?: DemoGpuMode
 ): Promise<LiveDemoRunState | null> {
   const resolvedProjectId =
-    projectId ?? (await latestProjectId(runMode, llmProvider, executionMode, sandboxMode));
+    projectId ??
+    (await latestProjectId(
+      runMode,
+      llmProvider,
+      executionMode,
+      sandboxMode,
+      verificationProvider,
+      gpuMode
+    ));
   if (!resolvedProjectId) {
     return null;
   }

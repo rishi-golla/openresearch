@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import type {
   DemoExecutionMode,
+  DemoGpuMode,
   DemoProvider,
   DemoSandboxMode
 } from "@/lib/demo/demo-run-types";
@@ -33,6 +34,15 @@ function toProvider(request: Request): DemoProvider | undefined {
   return undefined;
 }
 
+function toVerificationProvider(request: Request): DemoProvider | undefined {
+  const url = new URL(request.url);
+  const value = url.searchParams.get("verificationProvider");
+  if (value === "anthropic" || value === "openai") {
+    return value;
+  }
+  return undefined;
+}
+
 function toExecutionMode(request: Request): DemoExecutionMode | undefined {
   const url = new URL(request.url);
   const value = url.searchParams.get("executionMode");
@@ -51,13 +61,24 @@ function toSandboxMode(request: Request): DemoSandboxMode | undefined {
   return undefined;
 }
 
+function toGpuMode(request: Request): DemoGpuMode | undefined {
+  const url = new URL(request.url);
+  const value = url.searchParams.get("gpuMode");
+  if (value === "off" || value === "auto" || value === "prefer" || value === "max") {
+    return value;
+  }
+  return undefined;
+}
+
 export async function GET(request: Request) {
   const latest = await loadDemoRun(
     toProjectId(request),
     toRunMode(request),
     toProvider(request),
     toExecutionMode(request),
-    toSandboxMode(request)
+    toSandboxMode(request),
+    toVerificationProvider(request),
+    toGpuMode(request)
   );
   return NextResponse.json(latest);
 }
@@ -70,13 +91,19 @@ export async function POST(request: Request) {
       const paper = formData.get("paper");
       const mode = formData.get("mode");
       const provider = formData.get("provider");
+      const verificationProvider = formData.get("verificationProvider");
       const executionMode = formData.get("executionMode");
       const sandboxMode = formData.get("sandbox");
+      const gpuMode = formData.get("gpuMode");
       const runMode = mode === "sdk" || mode === "offline" ? mode : "offline";
       const llmProvider =
         provider === "anthropic" || provider === "openai"
           ? provider
           : toProvider(request) ?? "anthropic";
+      const runVerificationProvider =
+        verificationProvider === "anthropic" || verificationProvider === "openai"
+          ? verificationProvider
+          : toVerificationProvider(request);
       const runExecutionMode =
         executionMode === "efficient" || executionMode === "max"
           ? executionMode
@@ -85,6 +112,10 @@ export async function POST(request: Request) {
         sandboxMode === "auto" || sandboxMode === "docker" || sandboxMode === "local"
           ? sandboxMode
           : toSandboxMode(request) ?? "auto";
+      const runGpuMode =
+        gpuMode === "off" || gpuMode === "auto" || gpuMode === "prefer" || gpuMode === "max"
+          ? gpuMode
+          : toGpuMode(request) ?? "auto";
 
       if (!(paper instanceof File) || paper.size === 0) {
         return NextResponse.json(
@@ -112,7 +143,9 @@ export async function POST(request: Request) {
           uploadedPaper: {
             fileName: paper.name,
             bytes
-          }
+          },
+          verificationProvider: runVerificationProvider,
+          gpuMode: runGpuMode
         }
       );
       return NextResponse.json(run, { status: 202 });
@@ -122,7 +155,11 @@ export async function POST(request: Request) {
       toRunMode(request) ?? "offline",
       toProvider(request) ?? "anthropic",
       toExecutionMode(request) ?? "efficient",
-      toSandboxMode(request) ?? "auto"
+      toSandboxMode(request) ?? "auto",
+      {
+        verificationProvider: toVerificationProvider(request),
+        gpuMode: toGpuMode(request) ?? "auto"
+      }
     );
     return NextResponse.json(run, { status: 202 });
   } catch (error) {
@@ -138,7 +175,9 @@ export async function DELETE(request: Request) {
       toProjectId(request),
       toProvider(request),
       toExecutionMode(request),
-      toSandboxMode(request)
+      toSandboxMode(request),
+      toVerificationProvider(request),
+      toGpuMode(request)
     );
     return NextResponse.json(run);
   } catch (error) {

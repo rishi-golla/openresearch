@@ -6,6 +6,7 @@ import { ChevronDown } from "lucide-react";
 import { DashboardShell } from "@/features/dashboard/dashboard-shell";
 import type {
   DemoExecutionMode,
+  DemoGpuMode,
   DemoProvider,
   DemoSandboxMode,
   LiveDemoRunState
@@ -29,6 +30,28 @@ const PROVIDER_OPTIONS: Array<{ value: DemoProvider; label: string; helper: stri
     helper: "OpenAI Agents SDK"
   }
 ];
+type ReviewProviderOption = DemoProvider | "same";
+const REVIEW_PROVIDER_OPTIONS: Array<{
+  value: ReviewProviderOption;
+  label: string;
+  helper: string;
+}> = [
+  {
+    value: "same",
+    label: "Same",
+    helper: "Reuse builder SDK"
+  },
+  {
+    value: "openai",
+    label: "OpenAI",
+    helper: "Cross-check with Codex"
+  },
+  {
+    value: "anthropic",
+    label: "Anthropic",
+    helper: "Cross-check with Claude"
+  }
+];
 const EXECUTION_OPTIONS: Array<{
   value: DemoExecutionMode;
   label: string;
@@ -43,6 +66,28 @@ const EXECUTION_OPTIONS: Array<{
     value: "max",
     label: "Max",
     helper: "Higher confidence"
+  }
+];
+const GPU_OPTIONS: Array<{ value: DemoGpuMode; label: string; helper: string }> = [
+  {
+    value: "auto",
+    label: "Auto GPU",
+    helper: "Safe default"
+  },
+  {
+    value: "off",
+    label: "CPU safe",
+    helper: "Hide CUDA"
+  },
+  {
+    value: "prefer",
+    label: "Prefer GPU",
+    helper: "Use if present"
+  },
+  {
+    value: "max",
+    label: "Max GPU",
+    helper: "Higher budget"
   }
 ];
 const SANDBOX_OPTIONS: Array<{ value: DemoSandboxMode; label: string; helper: string }> = [
@@ -145,12 +190,16 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
   const [sdkProvider, setSdkProvider] = useState<DemoProvider>(
     initialRun?.llmProvider ?? "anthropic"
   );
+  const [reviewProvider, setReviewProvider] = useState<ReviewProviderOption>(
+    initialRun?.verificationProvider ?? "same"
+  );
   const [executionMode, setExecutionMode] = useState<DemoExecutionMode>(
     initialRun?.executionMode ?? "efficient"
   );
   const [sandboxMode, setSandboxMode] = useState<DemoSandboxMode>(
     initialRun?.sandboxMode ?? "auto"
   );
+  const [gpuMode, setGpuMode] = useState<DemoGpuMode>(initialRun?.gpuMode ?? "auto");
   const [selectedPaper, setSelectedPaper] = useState<File | null>(null);
   const [runningMode, setRunningMode] = useState<"offline" | "sdk" | null>(
     initialRun && (initialRun.status === "queued" || initialRun.status === "running")
@@ -181,7 +230,19 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
     if (run?.sandboxMode) {
       setSandboxMode(run.sandboxMode);
     }
-  }, [run?.executionMode, run?.llmProvider, run?.sandboxMode]);
+    if (run) {
+      setReviewProvider(run.verificationProvider ?? "same");
+    }
+    if (run?.gpuMode) {
+      setGpuMode(run.gpuMode);
+    }
+  }, [
+    run?.executionMode,
+    run?.gpuMode,
+    run?.llmProvider,
+    run?.sandboxMode,
+    run?.verificationProvider
+  ]);
 
   useEffect(() => {
     if (run?.status !== "queued" && run?.status !== "running") {
@@ -196,12 +257,17 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
     const projectId = run.projectId;
     const providerParam =
       run.runMode === "sdk" && run.llmProvider ? `&provider=${run.llmProvider}` : "";
+    const verificationParam =
+      run.runMode === "sdk" && run.verificationProvider
+        ? `&verificationProvider=${run.verificationProvider}`
+        : "";
     const executionParam = run.executionMode ? `&executionMode=${run.executionMode}` : "";
     const sandboxParam = run.sandboxMode ? `&sandbox=${run.sandboxMode}` : "";
+    const gpuParam = run.gpuMode ? `&gpuMode=${run.gpuMode}` : "";
     pollTimer.current = window.setTimeout(async () => {
       try {
         const response = await fetch(
-          `/api/demo?projectId=${projectId}&mode=${run.runMode}${providerParam}${executionParam}${sandboxParam}`,
+          `/api/demo?projectId=${projectId}&mode=${run.runMode}${providerParam}${verificationParam}${executionParam}${sandboxParam}${gpuParam}`,
           { cache: "no-store" }
         );
         if (!response.ok) {
@@ -236,8 +302,12 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
 
     try {
       const providerParam = mode === "sdk" ? `&provider=${sdkProvider}` : "";
+      const verificationParam =
+        mode === "sdk" && reviewProvider !== "same"
+          ? `&verificationProvider=${reviewProvider}`
+          : "";
       const response = await fetch(
-        `/api/demo?mode=${mode}${providerParam}&executionMode=${executionMode}&sandbox=${sandboxMode}`,
+        `/api/demo?mode=${mode}${providerParam}${verificationParam}&executionMode=${executionMode}&sandbox=${sandboxMode}&gpuMode=${gpuMode}`,
         {
           method: "POST"
         }
@@ -269,8 +339,10 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
       formData.set("paper", selectedPaper);
       formData.set("executionMode", executionMode);
       formData.set("sandbox", sandboxMode);
+      formData.set("gpuMode", gpuMode);
       if (mode === "sdk") {
         formData.set("provider", sdkProvider);
+        formData.set("verificationProvider", reviewProvider);
       }
 
       const response = await fetch("/api/demo", {
@@ -300,10 +372,15 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
     try {
       const providerParam =
         run.runMode === "sdk" && run.llmProvider ? `&provider=${run.llmProvider}` : "";
+      const verificationParam =
+        run.runMode === "sdk" && run.verificationProvider
+          ? `&verificationProvider=${run.verificationProvider}`
+          : "";
       const executionParam = run.executionMode ? `&executionMode=${run.executionMode}` : "";
       const sandboxParam = run.sandboxMode ? `&sandbox=${run.sandboxMode}` : "";
+      const gpuParam = run.gpuMode ? `&gpuMode=${run.gpuMode}` : "";
       const response = await fetch(
-        `/api/demo?projectId=${run.projectId}&mode=${run.runMode}${providerParam}${executionParam}${sandboxParam}`,
+        `/api/demo?projectId=${run.projectId}&mode=${run.runMode}${providerParam}${verificationParam}${executionParam}${sandboxParam}${gpuParam}`,
         { method: "DELETE" }
       );
       if (!response.ok) {
@@ -322,16 +399,23 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
   const currentPayload = run?.payload;
   const currentStage = currentPayload?.summary.stage ?? "not started";
   const activeProvider = run?.llmProvider ?? sdkProvider;
+  const activeReviewProvider = run?.verificationProvider ?? reviewProvider;
   const activeProviderLabel =
     PROVIDER_OPTIONS.find((option) => option.value === activeProvider)?.label ?? "Anthropic";
+  const activeReviewProviderLabel =
+    REVIEW_PROVIDER_OPTIONS.find((option) => option.value === activeReviewProvider)?.label ??
+    "Same";
   const activeExecutionMode = run?.executionMode ?? executionMode;
   const activeSandboxMode = run?.sandboxMode ?? sandboxMode;
+  const activeGpuMode = run?.gpuMode ?? gpuMode;
   const activeExecutionLabel =
     EXECUTION_OPTIONS.find((option) => option.value === activeExecutionMode)?.label ??
     "Efficient";
   const activeSandboxLabel =
     SANDBOX_OPTIONS.find((option) => option.value === activeSandboxMode)?.label ??
     "Auto Docker";
+  const activeGpuLabel =
+    GPU_OPTIONS.find((option) => option.value === activeGpuMode)?.label ?? "Auto GPU";
 
   return (
     <main className="min-h-screen bg-stone-950 px-6 py-10 text-stone-100">
@@ -352,7 +436,7 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
           </div>
 
           <div className="flex w-full flex-col gap-4 rounded-2xl border border-white/10 bg-white/5 p-4 sm:w-auto sm:min-w-[24rem]">
-            <div className="grid gap-3 sm:grid-cols-3">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
               <SelectControl
                 disabled={runningMode !== null}
                 id="sdk-provider"
@@ -360,6 +444,14 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
                 onChange={(value) => setSdkProvider(value as DemoProvider)}
                 options={PROVIDER_OPTIONS}
                 value={sdkProvider}
+              />
+              <SelectControl
+                disabled={runningMode !== null}
+                id="review-provider"
+                label="Review SDK"
+                onChange={(value) => setReviewProvider(value as ReviewProviderOption)}
+                options={REVIEW_PROVIDER_OPTIONS}
+                value={reviewProvider}
               />
               <SelectControl
                 disabled={runningMode !== null}
@@ -376,6 +468,14 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
                 onChange={(value) => setSandboxMode(value as DemoSandboxMode)}
                 options={SANDBOX_OPTIONS}
                 value={sandboxMode}
+              />
+              <SelectControl
+                disabled={runningMode !== null}
+                id="gpu-mode"
+                label="Compute"
+                onChange={(value) => setGpuMode(value as DemoGpuMode)}
+                options={GPU_OPTIONS}
+                value={gpuMode}
               />
             </div>
             <div className="flex flex-wrap gap-3">
@@ -499,8 +599,8 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
         {(currentStatus === "queued" || currentStatus === "running") && run ? (
           <div className="mt-6 rounded-2xl border border-sky-400/30 bg-sky-400/10 px-4 py-3 text-sm text-sky-50">
             {run.runMode === "sdk"
-              ? `The ${activeProviderLabel} SDK pipeline is running with ${activeExecutionLabel.toLowerCase()} profile and ${activeSandboxLabel.toLowerCase()} execution. This page refreshes checkpoints every few seconds.`
-              : `The offline demo is running with ${activeExecutionLabel.toLowerCase()} profile and ${activeSandboxLabel.toLowerCase()} execution. This page refreshes checkpoints every few seconds.`}
+              ? `The ${activeProviderLabel} SDK pipeline is running with ${activeReviewProviderLabel.toLowerCase()} review, ${activeExecutionLabel.toLowerCase()} profile, ${activeSandboxLabel.toLowerCase()} execution, and ${activeGpuLabel.toLowerCase()} compute. This page refreshes checkpoints every few seconds.`
+              : `The offline demo is running with ${activeExecutionLabel.toLowerCase()} profile, ${activeSandboxLabel.toLowerCase()} execution, and ${activeGpuLabel.toLowerCase()} compute. This page refreshes checkpoints every few seconds.`}
           </div>
         ) : null}
 
@@ -529,8 +629,8 @@ export function LiveDemoClient({ initialRun }: LiveDemoClientProps) {
             </p>
             <p className="mt-2 text-sm leading-6 text-stone-400">
               {run?.runMode === "sdk"
-                ? `${activeProviderLabel} agents, ${activeExecutionLabel.toLowerCase()} profile, ${activeSandboxLabel.toLowerCase()} execution.`
-                : `Deterministic offline path, ${activeExecutionLabel.toLowerCase()} profile, ${activeSandboxLabel.toLowerCase()} execution.`}
+                ? `${activeProviderLabel} agents, ${activeReviewProviderLabel.toLowerCase()} review, ${activeExecutionLabel.toLowerCase()} profile, ${activeSandboxLabel.toLowerCase()} execution, ${activeGpuLabel.toLowerCase()} compute.`
+                : `Deterministic offline path, ${activeExecutionLabel.toLowerCase()} profile, ${activeSandboxLabel.toLowerCase()} execution, ${activeGpuLabel.toLowerCase()} compute.`}
             </p>
           </div>
 

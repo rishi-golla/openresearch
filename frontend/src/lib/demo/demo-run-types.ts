@@ -8,6 +8,8 @@ export type DemoExecutionMode = "efficient" | "max";
 
 export type DemoSandboxMode = "auto" | "docker" | "local";
 
+export type DemoGpuMode = "off" | "auto" | "prefer" | "max";
+
 export type DemoRunStatus =
   | "queued"
   | "running"
@@ -20,8 +22,10 @@ export interface LiveDemoRunState {
   outputDir: string;
   runMode: DemoRunMode;
   llmProvider?: DemoProvider;
+  verificationProvider?: DemoProvider;
   executionMode?: DemoExecutionMode;
   sandboxMode?: DemoSandboxMode;
+  gpuMode?: DemoGpuMode;
   status: DemoRunStatus;
   sourceKind?: "workspace_fixture" | "uploaded_pdf";
   sourceLabel?: string;

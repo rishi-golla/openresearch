@@ -36,7 +36,7 @@ describe("LiveDemoClient", () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/demo?mode=sdk&provider=anthropic&executionMode=efficient&sandbox=auto",
+        "/api/demo?mode=sdk&provider=anthropic&executionMode=efficient&sandbox=auto&gpuMode=auto",
         {
           method: "POST"
         }
@@ -70,11 +70,17 @@ describe("LiveDemoClient", () => {
     fireEvent.change(screen.getByLabelText(/sandbox/i), {
       target: { value: "docker" }
     });
+    fireEvent.change(screen.getByLabelText(/review sdk/i), {
+      target: { value: "anthropic" }
+    });
+    fireEvent.change(screen.getByLabelText(/compute/i), {
+      target: { value: "prefer" }
+    });
     fireEvent.click(screen.getByRole("button", { name: /run sdk/i }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/demo?mode=sdk&provider=openai&executionMode=max&sandbox=docker",
+        "/api/demo?mode=sdk&provider=openai&verificationProvider=anthropic&executionMode=max&sandbox=docker&gpuMode=prefer",
         {
           method: "POST"
         }
@@ -130,8 +136,10 @@ describe("LiveDemoClient", () => {
     const formData = init.body as FormData;
     expect(formData.get("mode")).toBe("sdk");
     expect(formData.get("provider")).toBe("openai");
+    expect(formData.get("verificationProvider")).toBe("same");
     expect(formData.get("executionMode")).toBe("max");
     expect(formData.get("sandbox")).toBe("docker");
+    expect(formData.get("gpuMode")).toBe("auto");
     expect(formData.get("paper")).toBe(file);
   });
 });
