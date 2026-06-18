@@ -89,7 +89,7 @@ _RUN_EXPERIMENT_FATAL_FAILURES = {
 def _local_core_bootstrap_commands(requirements_path: "Path", torch_index: str) -> list[str]:
     """pip-install commands for the local-sandbox bootstrap, hardened by env_pin.
 
-    Installs the harness-owned cu121 core pins (torch/vision/audio) FIRST, then the
+    Installs the harness-owned cu121 core pins (torch/vision/audio) FIRST **unless the venv already carries a coherent CUDA-≥12.1 torch** (a modern Deep-Learning-VM image is kept, not downgraded), then the
     agent's requirements with any conflicting core re-pin stripped (writing
     ``requirements.hardened.txt`` next to ``requirements.txt``). This is the fix for the
     2026-06-07 All-Conv-Net collapse, where the agent's ``torch==2.2.0`` re-pin
@@ -121,10 +121,7 @@ def _local_core_bootstrap_commands(requirements_path: "Path", torch_index: str) 
             # later as missing_module. Strip such lines and keep the rest.
             kept, invalid = env_pin.sanitize_requirements(kept)
             if specs:
-                core_install_cmd = (
-                    f"python -m pip install {' '.join(specs)} "
-                    f"--index-url {torch_index} || true"
-                )
+                core_install_cmd = env_pin.core_install_command(specs, torch_index)
             if dropped or invalid:
                 hardened = requirements_path.with_name("requirements.hardened.txt")
                 header = [
@@ -5732,6 +5729,22 @@ def _execute_cell_matrix(ctx: "RunContext", code_path: str, caps, *, timeout_s: 
                         f"(stuck-Pending past timeout) — quota or stock unavailable; "
                         f"try reducing azure_max_nodes or requesting a quota increase")
             return _terminal("capacity_exhausted", _cap_msg, metrics, logs)
+        # budget_exhausted promotion (mirror of the capacity branch): the K8s runner
+        # refuses a cell with a "budget_exhausted:"-prefixed error once the per-run GPU
+        # spend (max_run_gpu_usd) or pod-seconds cap would be exceeded. When EVERY errored
+        # cell carries that prefix (no ok, no OOM), the bottleneck is the budget, not the
+        # code — promote to a terminal stop so the run reports instead of re-burning the
+        # already-exceeded budget on a pointless repair loop. K8s-path-only (local/runpod
+        # error strings never carry the prefix), so other backends are unchanged.
+        _all_budget_exhausted = all(
+            str((r.get("error") or "")).startswith("budget_exhausted:")
+            for r in _err_cells
+        )
+        if _all_budget_exhausted:
+            _budget_msg = (f"all {n_err} run cell(s) refused: per-run GPU budget would be "
+                           f"exceeded (max_run_gpu_usd / max_pod_seconds) — raise --max-usd "
+                           f"or reduce scope; spot pricing lowers the bill ~3x")
+            return _terminal("budget_exhausted", _budget_msg, metrics, logs)
 
     # All-timeout classification (audit 2026-06-11): when the time-budget cap
     # (cap_overall_budget) floors the matrix budget below even one cell's
@@ -6006,7 +6019,17 @@ def run_experiment(
     # Bound before the branch so the post-loop rubric-contract check (which reads
     # outputs/<run_id>) is valid on BOTH paths; the legacy loop reassigns it per
     # iteration, the cell route uses this value as its artifact root.
-    run_id = f"{ctx.project_id}-{uuid.uuid4().hex[:8]}"
+    # run_id keys the per-run artifact + object-store prefix (runs/<run_id>/cells/...).
+    # Default: a fresh random suffix per run_experiment call (distinct prefixes, no
+    # cross-attempt collision). When OPENRESEARCH_STABLE_RUN_ID is set (the unattended
+    # in-cluster orchestrator sets it so a rescheduled pod re-attaches to the SAME blob
+    # prefix and the K8s runner's Blob-resume skips already-completed cells), pin the
+    # run_id to the deterministic project_id (already paper+arm-derived). Unset → today's
+    # behavior, byte-identical.
+    if os.environ.get("OPENRESEARCH_STABLE_RUN_ID", "").strip():
+        run_id = ctx.project_id
+    else:
+        run_id = f"{ctx.project_id}-{uuid.uuid4().hex[:8]}"
     _cell_route_taken = False
     _hybrid_grid_result: dict | None = None  # set when the hybrid route stashes a grid result
     # Progress→SSE tailer (local only): emit a sanitized experiment_progress event from the
@@ -6960,7 +6983,7 @@ def verify_against_rubric(results: dict, rubric: dict, *, ctx: "RunContext") -> 
         scored = score_reproduction(
             rubric_tree=rubric,
             run_dir=ctx.project_dir,
-            llm_client=ctx.llm_client,
+            llm_client=getattr(ctx, "verifier_client", None) or ctx.llm_client,
             rubric_source=str(rubric.get("source") or "paperbench_bundle"),
             degraded=degraded,
             # Paper-hint invariant gate (2026-05-29): thread invariants from

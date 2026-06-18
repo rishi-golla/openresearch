@@ -123,6 +123,70 @@ class Settings(BaseSettings):
             "REPROLAB_OPENAI_ADMIN_KEY",
         ),
     )
+    # Azure OpenAI credentials. Mirrors the openai/anthropic key fields above:
+    # read both the bare ``AZURE_OPENAI_*`` names the Azure SDK uses and the
+    # Azure portal's "KEY 1" / "KEY 2" labels. Azure issues two interchangeable
+    # keys for zero-downtime rotation — KEY 1 is primary, KEY 2 the fallback.
+    # First match wins, so an explicit AZURE_OPENAI_API_KEY beats KEY1, which
+    # beats KEY2. configure_azure_openai_credentials() bridges these into the
+    # canonical AZURE_OPENAI_* process env the runtime/grader/accelerator read.
+    azure_openai_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_KEY1",
+            "AZURE_OPENAI_KEY2",
+            "OPENRESEARCH_AZURE_OPENAI_API_KEY",
+        ),
+    )
+    azure_openai_endpoint: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_ENDPOINT",
+            "OPENRESEARCH_AZURE_OPENAI_ENDPOINT",
+        ),
+    )
+    azure_openai_deployment: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_DEPLOYMENT",
+            "OPENRESEARCH_AZURE_OPENAI_DEPLOYMENT",
+        ),
+    )
+    azure_openai_api_version: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_API_VERSION",
+            "OPENRESEARCH_AZURE_OPENAI_API_VERSION",
+        ),
+    )
+    # Azure AI Foundry — a generic OpenAI-compatible custom endpoint
+    # (``https://<resource>.services.ai.azure.com/openai/v1``) serving any
+    # deployed model (e.g. Grok). Distinct from the classic Azure OpenAI surface
+    # above: this is the v1 OpenAI-compatible path the standard OpenAI SDK speaks
+    # to with a Bearer key. The ``azure-foundry`` root model reads these at
+    # resolve time, so swapping the deployed model is a .env change, not code.
+    azure_foundry_endpoint: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_FOUNDRY_ENDPOINT",
+            "OPENRESEARCH_AZURE_FOUNDRY_ENDPOINT",
+        ),
+    )
+    azure_foundry_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_FOUNDRY_API_KEY",
+            "OPENRESEARCH_AZURE_FOUNDRY_API_KEY",
+        ),
+    )
+    azure_foundry_deployment: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_FOUNDRY_DEPLOYMENT",
+            "OPENRESEARCH_AZURE_FOUNDRY_DEPLOYMENT",
+        ),
+    )
     codex_cli_path: str = ""
     codex_auth_path: str = ""
 
@@ -252,6 +316,7 @@ class Settings(BaseSettings):
     azure_node_pool_name: str = Field(default="gpua100", description="GPU node pool name (scale-to-zero)")
     azure_per_gpu_vram_gb: float = Field(default=80.0, ge=1.0, description="VRAM per GPU in the node pool (A100=80)")
     azure_max_nodes: int = Field(default=4, ge=1, description="Node pool max-nodes (orchestrator-side concurrency cap)")
+    azure_gpus_per_node: int = Field(default=1, ge=1, description="GPUs per AKS GPU node — see gcp_gpus_per_node.")
     # Empty means the operator MUST set OPENRESEARCH_AZURE_BASE_IMAGE to a PINNED
     # ACR tag (e.g. myregistry.azurecr.io/reprolab:20260603-abc1234). The runner
     # errors clearly on empty rather than defaulting to a floating :latest tag.
@@ -293,6 +358,19 @@ class Settings(BaseSettings):
         default=0,
         ge=0,
         description="Job.spec.backoffLimit (Pod-level retries); keep at 0 — OOM retry is delegated to the in-Job wrapper + podFailurePolicy",
+    )
+    # Spot/preemptible data plane (opt-in). Must be paired with the IaC `useSpot`
+    # node-pool flag: this knob makes the runtime add the spot-taint toleration to the
+    # cell Pod and (when job_backoff_limit is 0) reschedule a preempted cell onto a fresh
+    # spot node. Default false → on-demand behavior, no manifest change.
+    azure_use_spot: bool = Field(
+        default=False,
+        description="Provision/treat the AKS GPU pool as Spot — adds the spot-taint toleration to cell Pods (pair with the Bicep useSpot param)",
+    )
+    azure_spot_backoff_limit: int = Field(
+        default=3,
+        ge=0,
+        description="Job.spec.backoffLimit used ONLY when use_spot is on and job_backoff_limit is 0 — lets a preempted cell Job reschedule onto a new spot node",
     )
     # Path inside the Job Pod where the Azure Files share (HF_HOME + pip cache)
     # is mounted. Must match the volume mount in the Job template and the
@@ -355,6 +433,7 @@ class Settings(BaseSettings):
     gcp_node_pool_name: str = Field(default="gpua100", description="GPU node pool name (scale-to-zero)")
     gcp_per_gpu_vram_gb: float = Field(default=80.0, ge=1.0, description="VRAM per GPU in the node pool (A100=80)")
     gcp_max_nodes: int = Field(default=4, ge=1, description="Node pool max-nodes (orchestrator-side concurrency cap)")
+    gcp_gpus_per_node: int = Field(default=1, ge=1, description="GPUs per GKE GPU node — set to the node SKU's GPU count (e.g. 8 for a2-highgpu-8g) so that many single-GPU cells run concurrently per node. Default 1 = today's one-cell-per-node behaviour.")
     # Empty means the operator MUST set OPENRESEARCH_GCP_BASE_IMAGE to a PINNED
     # Artifact Registry tag. The runner errors clearly on empty rather than
     # defaulting to a floating :latest tag.
@@ -365,17 +444,28 @@ class Settings(BaseSettings):
     # Catalog short_names of the GCP GPU SKUs that are actually provisioned
     # as GKE node pools. The SKU resolver only selects from this list; the OOM
     # escalation ladder only advances within it.
+    # INVARIANT: this list must name exactly the reprolab/sku labels your tfvars
+    # `gpu_skus` variable provisions. The cell scheduler places Jobs via
+    # nodeSelector {reprolab/sku: <short_name>}; a short_name with no matching
+    # provisioned pool resolves to a label that exists on no node, so every cell
+    # stays Pending → capacity_exhausted. Keep config ⊇ TF pool labels.
     # pydantic-settings 2.x parses this from a JSON array env var:
-    #   OPENRESEARCH_GCP_GPU_SKUS='["gcp_a100_80","gcp_a100_80x2"]'
+    #   OPENRESEARCH_GCP_GPU_SKUS='["gcp_a100_80x8"]'
     # or from a comma-separated string via the built-in list coercion.
-    # Default = single A100-80 pool = one quota ask at cluster bootstrap.
+    # Default = the single 8×A100-80 pool (gcp_a100_80x8) that infra/gcp
+    # variables.tf `gpu_skus` provisions by default — needs gpu_count(8) ×
+    # max_nodes A100-80 GPUs of quota in the matching region.
+    # Lean smallest-two validation run: override to ["gcp_a100_80"] AND give
+    # tfvars a single 1-GPU gcp_a100_80 (a2-ultragpu-1g) pool — only
+    # gpu_count(1) × max_nodes A100-80 GPUs of quota.
     gcp_gpu_skus: list[str] = Field(
-        default_factory=lambda: ["gcp_a100_80"],
+        default_factory=lambda: ["gcp_a100_80x8"],
         description=(
             "Catalog short_names of the GCP GPU SKUs that are actually provisioned "
-            "as node pools. The resolver only selects from these; the OOM ladder "
-            "only escalates within these. "
-            "Default = single A100-80 pool = one quota ask."
+            "as node pools. Must equal the reprolab/sku labels tfvars `gpu_skus` "
+            "provisions (config ⊇ TF pools). The resolver only selects from these; "
+            "the OOM ladder only escalates within these. "
+            "Default = the single 8×A100-80 pool (gcp_a100_80x8) from the TF default."
         ),
     )
     # TTL added to the Job spec's ttlSecondsAfterFinished; Kubernetes deletes
@@ -392,6 +482,18 @@ class Settings(BaseSettings):
         default=0,
         ge=0,
         description="Job.spec.backoffLimit (Pod-level retries); keep at 0 — OOM retry is delegated to the in-Job wrapper",
+    )
+    # Spot/preemptible data plane (opt-in). Pair with the Terraform `use_spot` node-pool
+    # flag: adds the GKE spot-taint toleration to cell Pods and (when job_backoff_limit is
+    # 0) reschedules a preempted cell onto a fresh spot node. Default false → unchanged.
+    gcp_use_spot: bool = Field(
+        default=False,
+        description="Provision/treat the GKE GPU pool as Spot — adds the cloud.google.com/gke-spot toleration to cell Pods (pair with the TF use_spot var)",
+    )
+    gcp_spot_backoff_limit: int = Field(
+        default=3,
+        ge=0,
+        description="Job.spec.backoffLimit used ONLY when use_spot is on and job_backoff_limit is 0 — lets a preempted cell Job reschedule onto a new spot node",
     )
     # Path inside the Job Pod where the Filestore share (HF_HOME + pip cache)
     # is mounted. Must match the volume mount in the Job template.
@@ -424,6 +526,53 @@ class Settings(BaseSettings):
         default=600,
         ge=1,
         description="Timeout (seconds) for pip install in the Job bootstrap script",
+    )
+    # GCP orchestrator / secret-store knobs (Stream A parity with azure_* block)
+    # These are settings-only — no behaviour change when the new flags are off.
+    gcp_orchestrator_image: str = Field(
+        default="",
+        description=(
+            "Container image for the in-cluster GCP orchestrator (Deployment + CronJob). "
+            "Must be a PINNED Artifact Registry tag; must include the claude CLI + Node. "
+            "Operator sets this in the Helm --set or values override. "
+            "Read by helm/values.yaml, not directly by backend code."
+        ),
+    )
+    gcp_csi_mount_path: str = Field(
+        default="/mnt/sm-secrets",
+        description=(
+            "Mount path inside the orchestrator pod where the Secrets Store CSI driver "
+            "projects Secret Manager secret files. Must match orchestrator-deployment.yaml "
+            "volumeMount.mountPath."
+        ),
+    )
+    # Stream B — long-lived Claude OAuth token (headless/unattended root)
+    # CLAUDE_CODE_OAUTH_TOKEN is read natively by the claude CLI and the
+    # claude-agent-sdk (which shells out to the claude binary).  When set, it
+    # satisfies the claude-oauth credential check WITHOUT requiring a local
+    # ~/.claude/.credentials.json file, making --model claude-oauth viable in
+    # unattended environments (pods, CI) that cannot run `claude login`.
+    #
+    # This field is read-only from Settings — the actual env var is consumed
+    # directly by the claude binary.  We surface it here so:
+    #   1. The _has_claude_subscription_oauth() helper can detect it (it reads
+    #      the CLAUDE_CODE_OAUTH_TOKEN env var directly).
+    #   2. The shell-vs-.env override validator knows it is NOT a suspect key
+    #      (an operator intentionally sets it in-cluster; it should not warn).
+    claude_code_oauth_token: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENRESEARCH_CLAUDE_CODE_OAUTH_TOKEN",
+        ),
+        description=(
+            "Long-lived Claude OAuth token minted by `claude setup-token`. "
+            "When set, satisfies the claude-oauth credential check for headless / "
+            "unattended in-cluster runs without requiring ~/.claude/.credentials.json. "
+            "Value sourced from the secret store (Key Vault / Secret Manager) by the "
+            "orchestrator pod. Never set this in .env for local dev — use `claude login` "
+            "instead (the interactive flow writes ~/.claude/.credentials.json)."
+        ),
     )
 
     # --- Forced-iteration policy (Lane H, spec 2026-05-24) ---

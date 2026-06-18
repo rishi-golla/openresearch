@@ -89,15 +89,18 @@ gpu:
 
   # Default GPU SKU for smoke jobs and as the orchestrator fallback.
   # Must match a short_name in var.gpu_skus (i.e. a provisioned pool).
+  # Changed from azure_a100_80 (Standard_NC24ads_A100_v4, 1×A100-80GB) to
+  # azure_a100_40x8 (Standard_ND96asr_v4, 8×A100-40GB) — sized for the 7B
+  # 8-GPU SDAR cell on one node.
   # Override in envs/<env>/helm-values.yaml when additional pools are present.
   # [TF: gpu_pools — first entry's sku_label]
-  defaultSku: azure_a100_80
+  defaultSku: azure_a100_40x8
 
   # ── Legacy values — kept for any templates that still reference them ────────
   # These now refer to 'reprolab/sku' (the new primary key).  Remove once all
   # callers have migrated to skuLabelKey / defaultSku.
   nodePoolLabelKey: reprolab/sku
-  nodePoolLabelValue: azure_a100_80   # matches defaultSku above
+  nodePoolLabelValue: azure_a100_40x8   # matches defaultSku above
 
 # ---------------------------------------------------------------------------
 # RBAC — the orchestrator Entra group that is bound to the Job-management Role.
@@ -216,6 +219,60 @@ orchestrator:
   # AAD tenant ID of the subscription.
   # Obtain with: az account show --query tenantId -o tsv
   tenantId: ""
+
+  # ── Azure AI Foundry / grok (OAuth-free root + sub-agents; opt-in) ──────────
+  # Enables a fully OAuth-free cloud run: a grok root model + grok/OpenAI
+  # sub-agents.  endpoint/deployment are NON-SECRET resource coordinates (read
+  # by the backend as AZURE_FOUNDRY_ENDPOINT/AZURE_FOUNDRY_DEPLOYMENT); the
+  # apiKey toggle surfaces the 'azure-foundry-api-key' Key Vault secret as
+  # AZURE_FOUNDRY_API_KEY.  CRITICAL INVARIANT: all default empty/false so the
+  # DEFAULT render is byte-identical to HEAD.  Use with model=azure-foundry and
+  # roleModels/authStrategy below.
+  azureFoundry:
+    # Set to true purely for parity; the endpoint/deployment/apiKey gates below
+    # are what actually render env vars.
+    enabled: false
+    # Azure AI Foundry resource URL for the grok deployment.
+    endpoint: ""
+    # Azure AI Foundry deployment name (the deployed grok model).
+    deployment: ""
+    apiKey:
+      # Set to true to inject AZURE_FOUNDRY_API_KEY from the Key Vault secret
+      # 'azure-foundry-api-key'.  Requires the secret to exist (set out-of-band):
+      #   az keyvault secret set --vault-name <kv> --name azure-foundry-api-key \
+      #     --value "$AZURE_FOUNDRY_API_KEY"
+      enabled: false
+
+  # ── OpenAI API key (OAuth-free OpenAI sub-agents; opt-in) ───────────────────
+  # Set to true to inject OPENAI_API_KEY from the Key Vault secret
+  # 'openai-api-key'.  Requires the secret to exist (set out-of-band):
+  #   az keyvault secret set --vault-name <kv> --name openai-api-key \
+  #     --value "$OPENAI_API_KEY"
+  # Default false → no env var in the default render.
+  openaiApiKey:
+    enabled: false
+
+  # ── Per-role model selection + auth strategy (NON-SECRET; OAuth-free runs) ──
+  # roleModels → OPENRESEARCH_ROLE_MODELS (e.g. "executor=grok,grader=grok" or a
+  # JSON object) points each role at a provider.  authStrategy →
+  # OPENRESEARCH_LLM_AUTH_STRATEGY (auto|api_only|oauth_only); set api_only for a
+  # fully OAuth-free run.  Both default empty → no env var in the default render.
+  roleModels: ""
+  authStrategy: ""
+
+  # ── Long-lived Claude OAuth token (Stream B, opt-in) ────────────────────────
+  # CRITICAL INVARIANT: this block is DEFAULT FALSE so that the DEFAULT
+  # `helm template infra/azure/helm` render is byte-identical before and after
+  # this commit.  The env var CLAUDE_CODE_OAUTH_TOKEN and its secret mount
+  # appear ONLY when an operator sets orchestrator.claudeOauthToken.enabled=true.
+  claudeOauthToken:
+    # Set to true to inject CLAUDE_CODE_OAUTH_TOKEN from the Key Vault secret
+    # 'claude-code-oauth-token' as a container env var.
+    # Requires: the secret exists in Key Vault (set out-of-band):
+    #   az keyvault secret set --vault-name <kv> --name claude-code-oauth-token \
+    #     --value "$(claude setup-token)"
+    # and orchestrator.model=claude-oauth.
+    enabled: false
 
   # ── Deployment (always-on / interactive run) ────────────────────────────────
   deployment:

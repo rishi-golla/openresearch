@@ -57,16 +57,22 @@ _PATCH_LOCK = threading.Lock()
 _WALL_CLOCK_FLOOR_S = 60.0
 
 # Terminal failure classes that must NOT be force-iterated.  A shrink-exhausted
-# OOM (gpu_cell_runner spent its per-cell batch-scale ladder) or an explicit
-# capacity-exhausted stop cannot be fixed by re-running the same config — the
-# only honest move is to stop and ship the structured stop report.  Refusing
-# FINAL_VAR here just re-OOMs the next iteration (the 2026-05-31 death spiral).
+# OOM (gpu_cell_runner spent its per-cell batch-scale ladder), an explicit
+# capacity-exhausted stop, or a per-run GPU-budget exhaustion cannot be fixed by
+# re-running the same config — the only honest move is to stop and ship the
+# structured stop report.  Refusing FINAL_VAR here just re-OOMs (or re-burns the
+# already-exceeded budget on) the next iteration (the 2026-05-31 death spiral).
 # ``root_degenerate_loop`` is the analogous root-side terminal: the root has
 # called FINAL_VAR repeatedly with NO lifecycle progress (the degenerate
 # refusal loop, Task 4) — continuing to refuse only churns to the 16-refusal
 # cap / wall clock, so we accept the next FINAL_VAR and ship the report.
 _TERMINAL_FAILURE_CLASSES = frozenset(
-    {"oom_shrink_exhausted", "capacity_exhausted", "root_degenerate_loop"}
+    {
+        "oom_shrink_exhausted",
+        "capacity_exhausted",
+        "budget_exhausted",
+        "root_degenerate_loop",
+    }
 )
 
 
