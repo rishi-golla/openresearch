@@ -153,6 +153,13 @@ GPU_PRICING: dict[str, GpuPriceEntry] = {
         last_audited_utc=_AUDITED,
         cloud_type="ONDEMAND",
     ),
+    # Standard_ND96asr_v4 — 8×A100-40GB (spot-pool SKU added with the GCP/Azure
+    # spot work); eastus on-demand list rate, mirrors gpu_catalog.py.
+    "azure_a100_40x8": GpuPriceEntry(
+        usd_per_hour=27.20,
+        last_audited_utc=_AUDITED,
+        cloud_type="ONDEMAND",
+    ),
     # GCP A100 (a2 machine family, us-central1 on-demand). Per-GPU base prices —
     # a2-highgpu (40 GB) ≈ $3.67/GPU/hr, a2-ultragpu (80 GB) ≈ $5.07/GPU/hr —
     # scaled linearly by GPU count, matching the azure multi-GPU convention above.
