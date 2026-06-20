@@ -151,7 +151,9 @@ def _warn_on_shell_env_override() -> None:
     _SUSPECT_KEYS = (
         "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
         "FEATHERLESS_API_KEY", "OPENROUTER_API_KEY",
-        "AZURE_OPENAI_API_KEY", "OPENRESEARCH_RUNPOD_API_KEY",
+        "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT",
+        "AZURE_FOUNDRY_API_KEY", "AZURE_FOUNDRY_ENDPOINT", "AZURE_FOUNDRY_DEPLOYMENT",
+        "OPENRESEARCH_RUNPOD_API_KEY",
     )
     def _prefix(s: str) -> str:
         return f"{s[:10]}…{s[-4:]}" if len(s) > 14 else "<set>"
