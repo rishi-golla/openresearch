@@ -100,6 +100,25 @@ papers can use it secondarily with a generated rubric. The design spec is
 is `backend/agents/rdr/` (`models`, `decomposer`, `context_engineer`, `agent`,
 `controller`, `run`); the launcher is `scripts/rdr_paperbench.py`.
 
+## Provider unification — one vocabulary for all five LLM tiers (2026-06-20)
+
+The five LLM tiers an RLM run touches — root, executor, verifier, grader, and the
+navigation accelerator — are each independently routable, but they now share a
+single Azure-AI-Foundry vocabulary (`azure-foundry`, aliases `foundry`/`grok`)
+and a single credential resolver. The navigation accelerator
+(`backend/agents/rlm/accelerator.py`) was the last tier without a Foundry path;
+Workstream A added it and de-duplicated the rest so all five read the canonical
+`backend/agents/runtime/foundry_endpoint.py::resolve_foundry_credentials`
+(`os.environ` → Settings/.env → normalized `(base_url, deployment, api_key)`),
+never ad hoc. Foundry is an OpenAI-compatible Bearer endpoint, so every tier rides
+the plain OpenAI SDK (`OpenAILlmClient` / `OpenAiAgentRuntime` with a custom
+`base_url`) and none touches `ClaudeAgentOptions` — the SDK-isolation invariant is
+non-applicable by construction. Default-OFF + fail-soft: with `AZURE_FOUNDRY_*`
+unset, every tier is byte-for-byte the prior path. The shell-shadow validator
+(`cli.py`) also grew to cover `AZURE_FOUNDRY_*` and the Azure-OpenAI
+endpoint/deployment, since a stale shell endpoint 401s a run exactly like a stale
+key. Plan: `docs/superpowers/plans/2026-06-20-foundry-provider-unification.md`.
+
 ## Run lifecycle (UI ↔ backend)
 
 1. RLM lab UI (`frontend/src/components/lab/rlm/`) starts a run — arXiv link or
