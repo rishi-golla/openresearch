@@ -106,6 +106,26 @@ Prefer enabling/tightening an existing gate over new machinery. Ranked closures:
 3. **Defect #2:** a default-OFF deterministic AST lint over generated `code/` that
    flags unknown `from_pretrained`/known-API kwargs (sketch in the diagnosis doc).
 
+### Implementation status (2026-06-20)
+
+- **Fix 1 (Defect #1) — IMPLEMENTED, default-OFF.** `OPENRESEARCH_PER_MODEL_STATUS_GATE`
+  (`1`/`true`/`yes` = ON). New guard `_all_models_failed_violation`
+  (`backend/agents/rlm/primitives.py`) mirrors the cells-route `any_ok` rule:
+  per_model non-empty but NO entry at an ok status → repairable
+  `failure_class=all_models_failed` (in `_RUN_EXPERIMENT_REPAIRABLE_FAILURES`) +
+  `all_models_failed` `run_warning`, wired in the postflight chain after the
+  metrics-completeness block. **Unset ⇒ byte-for-byte today** (returns None). Tests
+  `tests/rlm/test_all_models_failed_guard.py` (hermetic, synthetic, zero GPU). The
+  default-flip is the operator's ≥3 paired GPU A/B + grader-σ step below — ship OFF.
+- **Fix 2 (Defect #3) — DEFERRED.** Flipping `OPENRESEARCH_EVIDENCE_GATE`'s leaf-veto
+  default to match its verdict-gate twin is gated on the grader-σ calibration AND a
+  GPU A/B sanity re-run (score-changing). Not done here; remains a runbook step.
+- **Fix 3 (Defect #2) — SKIPPED (net-negative).** The AST lint over generated `code/`
+  for unknown `from_pretrained`/API kwargs is net-negative: the runtime already
+  self-surfaces a bad kwarg as a `TypeError`/`code_bug` at execution (the existing
+  repair loop catches it), so a deterministic pre-lint adds maintenance surface and
+  false-positive risk for little marginal trust. Documented as a future option only.
+
 ## Validation policy (per repo rules)
 
 - **≥3 paired A/B runs** before flipping any default (`scripts/ab_compare.py`,
