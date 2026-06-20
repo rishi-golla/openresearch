@@ -56,6 +56,8 @@ import logging
 import os
 from dataclasses import dataclass
 
+from backend.agents.runtime.foundry_endpoint import FOUNDRY_MODE_ALIASES
+
 __all__ = [
     "AcceleratorEndpoint",
     "AcceleratorError",
@@ -511,7 +513,7 @@ def resolve_accelerator(
     if mode_lower == "azure":
         return _resolve_azure(explicit=True)
 
-    if mode_lower in {"azure-foundry", "foundry", "grok"}:
+    if mode_lower in FOUNDRY_MODE_ALIASES:
         return _resolve_foundry(explicit=True)
 
     if mode_lower == "endpoint":

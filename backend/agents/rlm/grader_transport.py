@@ -28,6 +28,8 @@ import logging
 import os
 from typing import Any
 
+from backend.agents.runtime.foundry_endpoint import FOUNDRY_MODE_ALIASES
+
 logger = logging.getLogger(__name__)
 
 
@@ -216,7 +218,7 @@ def build_transport_client(
             )
             return client, f"{role_label}:azure:{model}"
 
-        if backend in ("azure-foundry", "foundry", "grok"):
+        if backend in FOUNDRY_MODE_ALIASES:
             # Azure AI Foundry OpenAI-compatible v1 endpoint (e.g. Grok): Bearer
             # auth, base_url=…/openai/v1, model=deployment — rides the plain
             # OpenAI SDK (OpenAILlmClient), not AzureOpenAILlmClient. All creds

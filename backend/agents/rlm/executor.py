@@ -39,6 +39,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from backend.agents.runtime.foundry_endpoint import FOUNDRY_MODE_ALIASES
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "http://127.0.0.1:8001/v1"
@@ -46,7 +48,9 @@ _DEFAULT_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct"
 _DEFAULT_KEY = "local"
 _DEFAULT_MODES = {"", "sonnet", "claude", "off", "default", "anthropic"}
 _AZURE_MODES = {"azure", "azure-openai", "azure_openai", "aoai"}
-_FOUNDRY_MODES = {"azure-foundry", "foundry", "grok", "grok-4.3", "azure-foundry-openai"}
+# Foundry mode vocabulary — the single canonical set, shared with the
+# accelerator/factory/grader tiers (foundry_endpoint.FOUNDRY_MODE_ALIASES).
+_FOUNDRY_MODES = FOUNDRY_MODE_ALIASES
 _VLLM_MODES = {"qwen", "local", "vllm", "endpoint", "openai-endpoint", "on"}
 
 
