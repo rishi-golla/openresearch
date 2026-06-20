@@ -96,3 +96,21 @@ def test_start_sh_preflights_gke():
     start = (repo / "start.sh").read_text(encoding="utf-8")
     assert "gke_check.sh" in start
     assert "gcp" in start and "gke" in start
+
+
+def test_default_sandbox_setting_accepts_gke():
+    """OPENRESEARCH_DEFAULT_SANDBOX=gke must boot (Settings Literal accepts it)
+    so the start.sh gcp/gke preflight branch is reachable and gke is a
+    first-class default, not just a CLI/enum alias."""
+    from backend.config import Settings
+    s = Settings(_env_file=None, default_sandbox="gke")
+    assert s.default_sandbox == "gke"
+    # And it aliases to the gcp member downstream.
+    assert SandboxMode(s.default_sandbox) is SandboxMode.gcp
+
+
+def test_force_sandbox_setting_accepts_gke():
+    from backend.config import Settings
+    s = Settings(_env_file=None, force_sandbox="gke")
+    assert s.force_sandbox == "gke"
+    assert SandboxMode(s.force_sandbox) is SandboxMode.gcp
