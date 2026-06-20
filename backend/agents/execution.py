@@ -49,6 +49,10 @@ class SandboxMode(str, Enum):
         # everywhere — including OPENRESEARCH_FORCE_SANDBOX=gke and every
         # downstream `_sb_key == "gcp"` check — with zero further edits. A direct
         # SandboxMode('gcp') never reaches _missing_, so the gcp path is byte-for-byte.
+        # CAVEAT: CLI (`--sandbox gke`) + env (`OPENRESEARCH_DEFAULT_SANDBOX`/
+        # `_FORCE_SANDBOX`) are the supported `gke` surfaces; the HTTP `POST /runs`
+        # body field is typed `SandboxMode` and Pydantic rejects `gke` with a 422
+        # (the UI emits `gcp`).
         if isinstance(value, str) and value.strip().lower() == "gke":
             return cls.gcp
         return None

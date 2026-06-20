@@ -25,8 +25,12 @@ if [[ -f "${ENV_FILE}" ]]; then
     fi
   done < "${ENV_FILE}"
 fi
-: "${OPENRESEARCH_GCP_PROJECT:?FAIL  OPENRESEARCH_GCP_PROJECT not set (exit 2)}" || exit 2
-: "${OPENRESEARCH_GCP_GCS_BUCKET:?FAIL  OPENRESEARCH_GCP_GCS_BUCKET not set (exit 2)}" || exit 2
+if [[ -z "${OPENRESEARCH_GCP_PROJECT:-}" ]]; then
+  echo "FAIL  OPENRESEARCH_GCP_PROJECT not set (exit 2)" >&2; exit 2
+fi
+if [[ -z "${OPENRESEARCH_GCP_GCS_BUCKET:-}" ]]; then
+  echo "FAIL  OPENRESEARCH_GCP_GCS_BUCKET not set (exit 2)" >&2; exit 2
+fi
 command -v gcloud >/dev/null 2>&1 || { echo "FAIL  gcloud not found (exit 3)" >&2; exit 3; }
 gcloud auth application-default print-access-token >/dev/null 2>&1 \
   || { echo "FAIL  ADC missing — run: gcloud auth application-default login (exit 3)" >&2; exit 3; }

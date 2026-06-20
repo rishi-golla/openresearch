@@ -123,8 +123,16 @@ if [[ "${OPENRESEARCH_DEFAULT_SANDBOX}" == "gcp" || "${OPENRESEARCH_DEFAULT_SAND
             echo "[start.sh] Running GKE preflight (free)..."
         fi
         # macOS bash 3.2 empty-array guard (see runpod block).
-        if ! "${GKE_PREFLIGHT}" ${gke_args[@]+"${gke_args[@]}"}; then
-            echo "[start.sh] GKE preflight FAILED — refusing to start (set START_SKIP_PREFLIGHT=1 to bypass)."
+        gke_rc=0
+        "${GKE_PREFLIGHT}" ${gke_args[@]+"${gke_args[@]}"} || gke_rc=$?
+        if [[ "${gke_rc}" -eq 6 ]]; then
+            # exit 6 == the --start-pod smoke is an intentionally-unimplemented
+            # operator-gated stub. Treat it as a NON-FATAL skip so
+            # START_FULL_SMOKE=1 doesn't brick GKE startup; the free preflight
+            # checks above already ran. Any OTHER non-zero stays fatal.
+            echo "[start.sh] GKE pod smoke unimplemented (exit 6) — skipping smoke, continuing startup."
+        elif [[ "${gke_rc}" -ne 0 ]]; then
+            echo "[start.sh] GKE preflight FAILED (exit ${gke_rc}) — refusing to start (set START_SKIP_PREFLIGHT=1 to bypass)."
             exit 1
         fi
     elif [[ "${START_SKIP_PREFLIGHT:-0}" == "1" ]]; then

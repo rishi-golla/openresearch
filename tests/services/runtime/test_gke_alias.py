@@ -114,3 +114,21 @@ def test_force_sandbox_setting_accepts_gke():
     s = Settings(_env_file=None, force_sandbox="gke")
     assert s.force_sandbox == "gke"
     assert SandboxMode(s.force_sandbox) is SandboxMode.gcp
+
+
+def test_http_start_run_request_rejects_gke_accepts_gcp():
+    """Pin the REAL HTTP contract: `StartRunRequest.sandbox` is typed
+    `SandboxMode`, which Pydantic v2 validates by enum member-VALUE set — so the
+    `gke` alias (resolved only at `SandboxMode._missing_`, i.e. on direct enum
+    construction) does NOT apply over the wire and `gke` is rejected with a 422.
+    The UI emits `gcp`. This guards against anyone "fixing" the 422 by accident.
+    """
+    import pydantic
+
+    from backend.services.events.live_runs import StartRunRequest
+
+    with pytest.raises(pydantic.ValidationError):
+        StartRunRequest(sandbox="gke")
+
+    # `gcp` is a real enum member value → accepted over the wire.
+    assert StartRunRequest(sandbox="gcp").sandbox == SandboxMode.gcp
