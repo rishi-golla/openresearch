@@ -79,3 +79,20 @@ def test_aks_path_still_resolves_to_aks_backend():
 
         backend = _backend_for_sandbox_mode(SandboxMode.azure, run_budget=None)
         assert isinstance(backend, AksJobBackend)
+
+
+def test_gke_check_script_exists_and_executable():
+    import os
+    from pathlib import Path
+    repo = Path(__file__).parent.parent.parent.parent
+    script = repo / "scripts" / "gke_check.sh"
+    assert script.is_file(), "scripts/gke_check.sh must exist"
+    assert os.access(script, os.X_OK), "scripts/gke_check.sh must be executable"
+
+
+def test_start_sh_preflights_gke():
+    from pathlib import Path
+    repo = Path(__file__).parent.parent.parent.parent
+    start = (repo / "start.sh").read_text(encoding="utf-8")
+    assert "gke_check.sh" in start
+    assert "gcp" in start and "gke" in start
