@@ -237,6 +237,17 @@ def selected_provider(provider: ProviderName | str | None = None) -> ProviderNam
         return "anthropic"
     if normalized in {"openai", "oai"}:
         return "openai"
+    # Azure OpenAI and Azure AI Foundry are not ProviderName literals; both ride
+    # the OpenAI SDK surface, so generic sub-agents may name them here and get
+    # the "openai" literal back (matching validate_provider_credentials, which
+    # returns "openai" for azure as the "closest ProviderName"). The dedicated
+    # Azure/Foundry runtimes are selected upstream in make_runtime() before this
+    # call; this branch only lets a caller that passed the name through resolve.
+    if normalized in {
+        "azure", "azure-openai", "azure_openai",
+        "azure-foundry", "foundry", "grok", "grok-4.3", "azure-foundry-openai",
+    }:
+        return "openai"
     raise ProviderConfigurationError(
         provider=normalized,
         reason="expected 'anthropic' or 'openai'",
