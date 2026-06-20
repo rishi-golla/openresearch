@@ -418,38 +418,24 @@ def _env_or_settings(env_var: str, settings_attr: str) -> str:
         return ""
 
 
-def _normalize_foundry_base_url(raw: str) -> str:
-    """Normalise a Foundry endpoint to the ``/openai/v1`` base the OpenAI SDK appends to.
-
-    Accepts the bare resource URL, the ``/openai`` or ``/openai/v1`` base, or the
-    full ``/openai/v1/chat/completions`` path (whatever the operator pastes from
-    the portal) and returns the canonical ``…/openai/v1`` base.
-    """
-    url = (raw or "").strip().rstrip("/")
-    if url.endswith("/chat/completions"):
-        url = url[: -len("/chat/completions")].rstrip("/")
-    if url.endswith("/openai/v1"):
-        return url
-    if url.endswith("/openai"):
-        return url + "/v1"
-    return url + "/openai/v1"
-
-
 def _inject_foundry_kwargs(kwargs: dict, *, model_key: str) -> dict:
     """Return a copy of *kwargs* with the env-driven Foundry base_url + model_name.
 
-    Fully dynamic: ``AZURE_FOUNDRY_ENDPOINT`` → ``base_url`` (normalised),
-    ``AZURE_FOUNDRY_DEPLOYMENT`` → ``model_name``, read from ``os.environ`` first
-    then Settings (.env). Fails fast with an actionable message — never silently
-    falls through to the plain-OpenAI branch — when either is missing.
+    Single source of truth: delegates normalization + env/Settings resolution to
+    the canonical ``foundry_endpoint.resolve_foundry_credentials`` (no local
+    re-impl). Keeps its OWN fail-fast — the resolver returns ``("","","")``
+    without raising, but a missing base_url/deployment is fatal here. The
+    resolver's api_key is DISCARDED: the key is injected once, upstream, via
+    ``_inject_api_key(AZURE_FOUNDRY_API_KEY)``.
     """
+    from backend.agents.runtime.foundry_endpoint import resolve_foundry_credentials
+
     out = dict(kwargs)
-    endpoint = _env_or_settings("AZURE_FOUNDRY_ENDPOINT", "azure_foundry_endpoint")
-    deployment = _env_or_settings("AZURE_FOUNDRY_DEPLOYMENT", "azure_foundry_deployment")
+    base_url, deployment, _api_key = resolve_foundry_credentials()
     missing = [
         name
         for name, val in (
-            ("AZURE_FOUNDRY_ENDPOINT", endpoint),
+            ("AZURE_FOUNDRY_ENDPOINT", base_url),
             ("AZURE_FOUNDRY_DEPLOYMENT", deployment),
         )
         if not val
@@ -462,7 +448,7 @@ def _inject_foundry_kwargs(kwargs: dict, *, model_key: str) -> dict:
             "https://<resource>.services.ai.azure.com/openai/v1) and "
             "AZURE_FOUNDRY_DEPLOYMENT (the deployed model name, e.g. grok-4.3)."
         )
-    out["base_url"] = _normalize_foundry_base_url(endpoint)
+    out["base_url"] = base_url
     out["model_name"] = deployment
     return out
 
