@@ -16,6 +16,15 @@ Selection (``OPENRESEARCH_EXECUTOR``):
                                         ``AZURE_OPENAI_DEPLOYMENT``; no health-probe —
                                         Azure is a managed endpoint, credential presence
                                         is the gate; default stays Sonnet; EXPERIMENTAL)
+  - ``azure-foundry`` / ``foundry`` /
+    ``grok`` / ``grok-4.3``             → Azure AI Foundry OpenAI-compatible deployment
+                                        (e.g. Grok), via the canonical
+                                        ``foundry_endpoint.resolve_foundry_credentials``
+                                        (``AZURE_FOUNDRY_ENDPOINT`` /
+                                        ``AZURE_FOUNDRY_DEPLOYMENT`` /
+                                        ``AZURE_FOUNDRY_API_KEY``); graceful fallback to
+                                        the default Sonnet executor on incomplete creds
+                                        (never fail-fast); EXPERIMENTAL)
 
 Env: ``OPENRESEARCH_EXECUTOR_BASE_URL`` (default ``http://127.0.0.1:8001/v1``),
 ``OPENRESEARCH_EXECUTOR_MODEL`` (default ``Qwen/Qwen2.5-Coder-32B-Instruct``),
@@ -37,6 +46,7 @@ _DEFAULT_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct"
 _DEFAULT_KEY = "local"
 _DEFAULT_MODES = {"", "sonnet", "claude", "off", "default", "anthropic"}
 _AZURE_MODES = {"azure", "azure-openai", "azure_openai", "aoai"}
+_FOUNDRY_MODES = {"azure-foundry", "foundry", "grok", "grok-4.3", "azure-foundry-openai"}
 _VLLM_MODES = {"qwen", "local", "vllm", "endpoint", "openai-endpoint", "on"}
 
 
@@ -95,6 +105,28 @@ def resolve_executor() -> ExecutorPlan | None:
         runtime = AzureOpenAiAgentRuntime()
         logger.info("executor tier active: azure-openai → deployment=%s", deployment)
         return ExecutorPlan(runtime=runtime, model=deployment, label=f"azure:{deployment}")
+
+    if mode in _FOUNDRY_MODES:
+        # Foundry (OpenAI-compatible custom endpoint, e.g. Grok). Graceful
+        # fallback — a missing/incomplete cred set must NEVER fail-fast here
+        # (preserves the legacy OPENRESEARCH_EXECUTOR contract); the run keeps
+        # the default Sonnet executor instead.
+        from backend.agents.runtime.foundry_endpoint import resolve_foundry_credentials
+
+        base_url, deployment, api_key = resolve_foundry_credentials()
+        if not (base_url and api_key and deployment):
+            logger.warning(
+                "OPENRESEARCH_EXECUTOR=%r but AZURE_FOUNDRY_ENDPOINT / "
+                "AZURE_FOUNDRY_DEPLOYMENT / AZURE_FOUNDRY_API_KEY incomplete"
+                " — falling back to the default Sonnet executor",
+                mode,
+            )
+            return None
+        from backend.agents.runtime.azure_foundry_runtime import AzureFoundryAgentRuntime
+
+        runtime = AzureFoundryAgentRuntime()
+        logger.info("executor tier active: azure-foundry → deployment=%s", deployment)
+        return ExecutorPlan(runtime=runtime, model=deployment, label=f"azure-foundry:{deployment}")
 
     if mode not in _VLLM_MODES:
         logger.warning("unknown OPENRESEARCH_EXECUTOR=%r; using the default Sonnet executor", mode)
