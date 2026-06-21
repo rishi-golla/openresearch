@@ -23,6 +23,7 @@ import threading
 from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 from typing import Any, Callable
 
+from backend.agents.rlm.arg_contracts import validate_primitive_args
 from backend.agents.rlm.context import RunContext
 
 logger = logging.getLogger(__name__)
@@ -509,6 +510,8 @@ def wrap_primitive(name: str, fn: Callable[..., Any], ctx: RunContext) -> Callab
                 guard_result = None
                 if name == "run_experiment":
                     args, guard_result = _run_experiment_contract_guard(args)
+                if guard_result is None:
+                    guard_result = validate_primitive_args(name, fn, args, kwargs)
 
                 if guard_result is not None:
                     result = guard_result
@@ -608,6 +611,30 @@ def wrap_primitive(name: str, fn: Callable[..., Any], ctx: RunContext) -> Callab
                 ctx.dashboard.primitive_call(name, "error", result_summary=summary)
                 _emit_primitive_resource(ctx, primitive=name, boundary="end")
                 _ledger("raised")
+                # P1 lifecycle ledger — record the raised outcome HERE: the
+                # post-validation append below is unreachable from the except path,
+                # so a raised primitive would otherwise be absent from the ledger.
+                # Only the exception TYPE name (value-free) is stored. Fail-soft —
+                # the re-raise below is never masked.
+                try:
+                    from backend.agents.rlm.lifecycle_ledger import (
+                        LedgerRecord,
+                        append_record,
+                        lifecycle_ledger_enabled,
+                        project_inputs,
+                    )
+                    if lifecycle_ledger_enabled():
+                        append_record(ctx.project_dir, LedgerRecord(
+                            primitive=name,
+                            seq=len(ctx.cost_ledger.entries),
+                            inputs_projection=project_inputs(name, kwargs),
+                            outputs_pointer={"error_type": type(exc).__name__},
+                            evidence_keys=[],
+                            outcome="raised",
+                            iteration=int(getattr(ctx, "current_iteration", 0) or 0),
+                        ))
+                except Exception:  # noqa: BLE001 — the ledger must never mask the re-raise
+                    pass
                 logger.warning("primitive %s raised %s", name, type(exc).__name__)
                 raise
             # Most primitives are fail-soft: on failure they RETURN a failure-shaped
@@ -654,6 +681,63 @@ def wrap_primitive(name: str, fn: Callable[..., Any], ctx: RunContext) -> Callab
                     update_context_map(ctx.project_dir, name, result)
                 except Exception:  # noqa: BLE001 — orientation cache must never break the run
                     pass
+            # P1.2 — lifecycle ledger record-only sidecar (OPENRESEARCH_LIFECYCLE_LEDGER,
+            # default OFF).  Placed here so _emit_supplemental has already run for the
+            # success path; failed/timeout paths are also covered.  Fail-soft: the
+            # ledger must NEVER break a primitive.  No short-circuit — record-only.
+            try:
+                from backend.agents.rlm.lifecycle_ledger import (
+                    LedgerRecord,
+                    append_record,
+                    lifecycle_ledger_enabled,
+                    project_inputs,
+                )
+                if lifecycle_ledger_enabled():
+                    # Derive outcome mirroring the cost-ledger three-way stamp.
+                    # The `raised` path re-raises before reaching here, so only
+                    # ok/failed/timeout arrive at this point.
+                    _is_retryable_hang = (
+                        isinstance(result, dict)
+                        and result.get("outcome") == "retryable"
+                        and result.get("error") == "primitive_hung"
+                    )
+                    _is_partial_timeout = (
+                        failed
+                        and isinstance(result, dict)
+                        and (
+                            result.get("partial_timeout") is True
+                            or result.get("failure_class") == "partial_timeout"
+                        )
+                    )
+                    if _is_retryable_hang or _is_partial_timeout:
+                        _lifecycle_outcome = "timeout"
+                    elif failed:
+                        _lifecycle_outcome = "failed"
+                    else:
+                        _lifecycle_outcome = "ok"
+                    # outputs_pointer: bounded disk pointers, never paper text.
+                    _outputs_pointer: dict = {"code_dir": "code"}
+                    _metrics_path = ctx.project_dir / "code" / "metrics.json"
+                    if _metrics_path.exists():
+                        _outputs_pointer["metrics"] = "code/metrics.json"
+                    _env_id = result.get("env_id") if isinstance(result, dict) else None
+                    if _env_id:
+                        _outputs_pointer["env_id"] = str(_env_id)
+                    # seq: use current cost-ledger length as a best-effort monotonic
+                    # ordinal (already incremented by _ledger() above).
+                    _seq = len(ctx.cost_ledger.entries)
+                    _record = LedgerRecord(
+                        primitive=name,
+                        seq=_seq,
+                        inputs_projection=project_inputs(name, kwargs),
+                        outputs_pointer=_outputs_pointer,
+                        evidence_keys=[],
+                        outcome=_lifecycle_outcome,
+                        iteration=int(getattr(ctx, "current_iteration", 0) or 0),
+                    )
+                    append_record(ctx.project_dir, _record)
+            except Exception:  # noqa: BLE001 — ledger must never break a primitive
+                pass
             # Steering (main 2026-06-09): surface unread operator messages inside
             # primitive results so the root sees them without polling.
             result = _inject_operator_messages(name, result, ctx)
