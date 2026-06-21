@@ -49,6 +49,7 @@ _RUN_EXPERIMENT_REPAIRABLE_FAILURES = {
     "degenerate_training",
     "disk_exhausted",
     "incomplete_metrics",
+    "all_models_failed",      # Workstream C Fix 1: per_model non-empty, no ok status (flag-gated)
     "contract_violation",
     # Existing classifier labels that require agent-side repair.
     "missing_module",
@@ -2977,6 +2978,52 @@ def _metrics_completeness_violation(result: dict) -> tuple[str, str] | None:
                 "treated as 'not measured'.",
             )
     return None
+
+
+def _all_models_failed_violation(result: dict) -> tuple[str, str] | None:
+    """Detect a ``success=True`` run whose per_model is non-empty but NO entry
+    reached an ok status — every model errored/failed at load/train, yet the
+    subprocess exited 0 so ``success`` was reported true (the latent fake-green).
+
+    The monolithic ``run_experiment`` path sets ``success = all(r.succeeded …)`` —
+    subprocess exit only. An all-errored result (e.g. every per_model entry carries
+    ``status:"failed"`` + a ``0.0`` numeric) sails through every other guard:
+    ``_metrics_completeness_violation`` only fires when entries are EMPTY
+    placeholders (an error-bearing entry with a ``0.0`` passes
+    ``_per_model_has_measured_value``), and ``_degenerate_training_violation`` only
+    judges models whose status is in :data:`_OK_STATUSES` (a ``failed`` model is
+    skipped). This guard closes that narrow gap, mirroring the cells-route
+    ``any_ok`` rule (``cell_matrix.py``).
+
+    DEFAULT-OFF behind ``OPENRESEARCH_PER_MODEL_STATUS_GATE`` (``1``/``true``/``yes``
+    = ON; anything else/unset = OFF) — with it unset, behavior is byte-for-byte
+    today (the all-errored row still returns success=true and no guard fires). The
+    default-flip is gated on the operator's >=3 paired GPU A/B + grader-sigma
+    runbook step. Returns ``(failure_class, message)`` or ``None``.
+    """
+    if os.environ.get("OPENRESEARCH_PER_MODEL_STATUS_GATE", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        return None
+    per_model = metrics.get("per_model")
+    if not isinstance(per_model, dict) or not per_model:
+        return None
+    ok = [
+        m for m, mv in per_model.items()
+        if isinstance(mv, dict) and str(mv.get("status", "")).lower() in _OK_STATUSES
+    ]
+    if ok:
+        return None
+    names = ", ".join(map(str, list(per_model.keys())[:4]))
+    return (
+        "all_models_failed",
+        f"all_models_failed: per_model has {len(per_model)} model(s) ({names}) but NONE "
+        f"reached an ok status ({sorted(_OK_STATUSES)}) — every model errored/failed, yet "
+        "the experiment exited 0 so success was reported true. Fix the failing model "
+        "load/train so at least one model reaches a terminal ok status with measured "
+        "metrics, then re-run.",
+    )
 
 
 def _training_health_violation(result: dict) -> tuple[str, str] | None:
@@ -6389,6 +6436,28 @@ def run_experiment(
             except Exception:  # noqa: BLE001 — diagnostics must never break the run
                 logger.debug("run_experiment: metrics_incomplete event emit failed")
             logger.warning("run_experiment[%s]: %s", getattr(ctx, "run_id", "?"), _cmsg)
+
+    # All-models-failed postflight (Workstream C Fix 1, default-OFF behind
+    # OPENRESEARCH_PER_MODEL_STATUS_GATE): a run that exited 0 but whose per_model
+    # is non-empty with NO entry at an ok status — every model errored/failed at
+    # load/train, yet success=all(r.succeeded) reported true. The completeness guard
+    # above passes an error-bearing entry that carries a 0.0 numeric, and the
+    # degenerate-training guard skips non-ok-status models, so without this the
+    # fake-green ships silently. Flip it to a repairable failure (mirrors the
+    # cells-route any_ok rule) and emit a loud warning. Flag-gated default-OFF →
+    # byte-for-byte today when unset (the function returns None).
+    if result.get("success"):
+        _allfail = _all_models_failed_violation(result)
+        if _allfail is not None:
+            _afcls, _afmsg = _allfail
+            result = {**result, "success": False, "error": _afmsg, "failure_class": _afcls}
+            try:
+                _emit_dashboard_event(ctx, event_type="run_warning", payload={
+                    "code": "all_models_failed", "message": _afmsg,
+                })
+            except Exception:  # noqa: BLE001 — diagnostics must never break the run
+                logger.debug("run_experiment: all_models_failed event emit failed")
+            logger.warning("run_experiment[%s]: %s", getattr(ctx, "run_id", "?"), _afmsg)
 
     # Scope-shape validation (PR B): if scope is multi-model / multi-dataset,
     # require metrics.json to carry the expected per_model / per_dataset
