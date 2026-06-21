@@ -113,6 +113,27 @@ def sample_completions(
     return [client.complete(system=system, user=user) for _ in range(n)]
 
 
+def resolve_azure_deployment(model_override: str | None) -> str | None:
+    """Single source of the Azure OpenAI ``model -> deployment`` rule.
+
+    On Azure OpenAI the *deployment* routes the request (it becomes the URL
+    path); the ``model`` arg is largely cosmetic. An explicit model override
+    (e.g. ``OPENRESEARCH_VALIDATOR_MODEL=<deploymentB>``) must therefore override
+    the deployment too, else two "different" same-provider roles would both hit
+    ``AZURE_OPENAI_DEPLOYMENT`` and the separation would be a lie. Falls back to
+    ``AZURE_OPENAI_DEPLOYMENT`` (stripped) and finally ``None``.
+
+    Consumed by :func:`build_transport_client` (azure branch) and by
+    ``run.py::_validator_separation_tier`` — previously each re-derived this rule
+    and was kept in sync by comment only (ADR 2026-06-21, Decision 1).
+    """
+    return (
+        model_override
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT", "").strip()
+        or None
+    )
+
+
 def build_transport_client(
     *,
     backend: str | None,
@@ -208,14 +229,9 @@ def build_transport_client(
             # (e.g. OPENRESEARCH_VALIDATOR_MODEL=<deploymentB>) must override the
             # DEPLOYMENT too, otherwise executor(deploymentA) and a "different"
             # validator would both hit AZURE_OPENAI_DEPLOYMENT (deploymentA) and
-            # the validator separation would be a lie. Override falls back to
-            # AZURE_OPENAI_DEPLOYMENT when no override is given (unchanged behaviour
-            # for the existing grader path).
-            azure_deployment = (
-                model_override
-                or os.environ.get("AZURE_OPENAI_DEPLOYMENT", "").strip()
-                or None
-            )
+            # the validator separation would be a lie. Single resolver shared with
+            # run.py::_validator_separation_tier (ADR 2026-06-21, Decision 1).
+            azure_deployment = resolve_azure_deployment(model_override)
             api_key = os.environ.get("AZURE_OPENAI_API_KEY", "").strip() or None
             model = model_override or "gpt-4o"
             client = AzureOpenAILlmClient(

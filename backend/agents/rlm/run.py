@@ -2142,18 +2142,21 @@ def _validator_separation_tier(role_selection: Any) -> str:
             "grok": PROVIDER_AZURE_FOUNDRY,
         }
         val_provider = _BACKEND_PROVIDER.get(backend, backend)
-        # The actual validator model/deployment for the tier comparison.
-        # For the azure backend, OPENRESEARCH_VALIDATOR_MODEL overrides the
-        # deployment — same logic as build_transport_client's azure branch.
-        val_model = (
-            os.environ.get("OPENRESEARCH_VALIDATOR_MODEL", "").strip()
-            or (
-                os.environ.get("AZURE_OPENAI_DEPLOYMENT", "").strip()
-                if val_provider == PROVIDER_AZURE
-                else ""
-            )
-            or None
+        # The actual validator model/deployment for the tier comparison. For the
+        # azure backend the OPENRESEARCH_VALIDATOR_MODEL override resolves to the
+        # deployment via the SINGLE shared resolver (ADR 2026-06-21, Decision 1) —
+        # no longer re-derived here.
+        val_model_override = (
+            os.environ.get("OPENRESEARCH_VALIDATOR_MODEL", "").strip() or None
         )
+        if val_provider == PROVIDER_AZURE:
+            from backend.agents.rlm.grader_transport import (  # noqa: PLC0415
+                resolve_azure_deployment,
+            )
+
+            val_model = resolve_azure_deployment(val_model_override)
+        else:
+            val_model = val_model_override
         val_spec = RoleSpec(
             role="validator",
             token=backend,
