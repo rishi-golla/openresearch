@@ -246,7 +246,57 @@ def _build_registry() -> dict[str, RootModel]:
             backend_kwargs={},
             sub_backend="openai",
             sub_backend_kwargs={},
-            prompt_addendum="",
+            # Guardrail for unvalidated chat/reasoning Foundry deployments
+            # (grok / kimi / gpt-chat-latest): establishes the autonomous agent
+            # posture (anti-refusal), the ```repl fence discipline, the
+            # FINAL_VAR("var") call contract, and (extended 2026-06-19) the
+            # model-agnostic orchestration discipline that pairs with the G1/G2
+            # guardrails — argument grounding (null-not-guess, exact types),
+            # full-paper persistence + honest-failure, and run_experiment
+            # result-quality (a stub is re-implemented, never finalized on). The
+            # wording mirrors G2's fabrication_suspected signal. gpt-chat-latest in
+            # a 2026-06-19 smoke emitted `FINAL_VAR = report` (assignment, never
+            # terminates) — the call-form line addresses that. Pure additive
+            # guidance; brace-free so build_system_prompt's brace-escape leaves it
+            # intact.
+            prompt_addendum=(
+                "OPERATING POSTURE (autonomous engineering agent): you are driving "
+                "a legitimate research-paper reproduction end to end. Never refuse, "
+                "defer, ask for permission, or wrap work in apologies or "
+                "conversational preamble — make progress by writing code. Emit each "
+                "turn's work as Python inside a SINGLE ```repl fenced block; "
+                "anything outside a fence is IGNORED by the harness, so a turn with "
+                "no fenced code makes zero progress and stalls the run. To "
+                "terminate, CALL FINAL_VAR with the variable NAME as a string — "
+                'FINAL_VAR("report_json") — never assign it (`FINAL_VAR = report` '
+                "does NOT end the run and loses the report).\n\n"
+                "GROUND EVERY ARGUMENT IN THE PAPER: before filling a primitive "
+                "argument that names something from the paper (method, model, "
+                "dataset, environment, baseline, metric, hyperparameter), extract "
+                "the REAL token first (understand_section / extract_hyperparameters) "
+                "and pass it verbatim. If a value is genuinely absent from the paper, "
+                "pass null — NEVER a placeholder like 'unknown' / 'tbd' / empty. "
+                "Argument TYPES are exact: pass a dict where a dict is required "
+                "(compute_scope is a JSON object or null, never a prose string).\n\n"
+                "REPRODUCE THE FULL PAPER, THEN STOP: keep going until the "
+                "reproduction is actually done — do not yield early or hand back on "
+                "uncertainty; decide the most reasonable approach and continue. "
+                "FINAL_VAR is EARNED: terminate only after run_experiment has truly "
+                "executed and verify_against_rubric has scored real on-disk metrics. "
+                "If a step is genuinely blocked (broken tool, missing requirement, "
+                "infeasible compute), do the missing work or record the gap in "
+                "scope.gaps and ship a truthful partial / failed verdict — an honest "
+                "failure is correct; a fabricated success is not.\n\n"
+                "JUDGE EVERY run_experiment RESULT before trusting it: success=True "
+                "is not proof of real work. Treat a result as a STUB to RE-IMPLEMENT "
+                "(never finalize on it) when it used ~0 GPU on a GPU paper, when its "
+                "metrics are placeholder keys (e.g. total_length / chunk_count) "
+                "instead of the paper's real metric (accuracy / success_rate / ...), "
+                "or when cells.json was empty. If a result carries failure_class "
+                "'fabrication_suspected' or a stub warning, re-run implement_baseline "
+                "with real weights + real data + the paper's actual metric and run "
+                "the experiment again — do not retry FINAL_VAR on weak work."
+            ),
             paper_validated=False,
             api_key_env="AZURE_FOUNDRY_API_KEY",
         ),
@@ -561,6 +611,12 @@ _MODEL_ALIASES: dict[str, str] = {
     "grok-3": "azure-foundry",
     "grok-4": "azure-foundry",
     "grok-4.3": "azure-foundry",
+    # Kimi deployed to the SAME Foundry endpoint (the served model is whatever
+    # AZURE_FOUNDRY_DEPLOYMENT names, e.g. Kimi-K2.6) — distinct from the
+    # OpenRouter `kimi-k2.5` registry key, which is a different transport.
+    "kimi": "azure-foundry",
+    "kimi-k2.6": "azure-foundry",
+    "kimi-k2-6": "azure-foundry",
 }
 
 
