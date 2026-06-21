@@ -20,6 +20,25 @@
 
 ---
 
+## ⚠️ Ownership gate (added 2026-06-21 after advisor review) — Phase A is NOT solo-executable
+This is a **shared repo with an active second human** (`lolout1 <appradhann@gmail.com>`).
+Branch merge-status and file-collision were not the binding constraint — **ownership is.**
+Verified authorship:
+- `feat/azure-aks-gpu`, `feat/gcp-gke-backend` → **lolout1** (do NOT delete unilaterally).
+- `bes` → "Aayush C Baniya" (a different GitHub handle than the working account
+  `thisisaayushbaniya`) — ambiguous; do NOT delete.
+- **#110** (the PR A2 would close) → **lolout1's** PR; its content currently lives ONLY on
+  the unmerged `feat/grounded-harness-integration` (#116). Closing it now could destroy the
+  canonical PR if #116 reworks or never lands.
+- The 3 root `.md` (`bes_integration.md`, `claude_gcp_sdar_handoff.md`, `issues.md`) →
+  **lolout1's**, authored 3–5 days ago.
+- `feat/gepa-integration` → the operator's own (`thisisaayushbaniya`).
+**Rule:** every Phase A item is **"propose to the owner," not "do solo."** The only
+solo-safe, in-bounds work in this whole design is B3's two additive safety tests
+(`_apply_legacy_env_aliases`, the db fallback) — and even those stack on the unmerged tower,
+so they are a choice, not a default. Net: **no cleanup is executable solo right now** — it is
+all owner-coordination-gated (Phase A) or merge-gated (Phase B).
+
 ## Phase A — Safe now · one tiny PR off the trunk · zero conflict
 
 **A1. Branch prune** (merged into trunk AND no open PR):
