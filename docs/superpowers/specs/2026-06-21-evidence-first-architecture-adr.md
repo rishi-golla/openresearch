@@ -87,12 +87,12 @@ not merge them:
 
 | # | Pair | Decision | Risk | Status |
 |---|---|---|---|---|
-| 1 | validator deployment resolution (`run.py::_validator_separation_tier`) ↔ `build_transport_client` azure branch | **SUBSUME** into one resolver | **LOW** — behavior-preserving | **DO NOW (TDD)** |
-| 2 | `evidence_audit.run_level_clean` ↔ `_apply_evidence_gate` (default **ON**) | **COMPOSE, do NOT retire** | **HIGH** — touches default-ON forge defense | **DEFERRED — guardrails below** |
+| 1 | validator deployment resolution (`run.py::_validator_separation_tier`) ↔ `build_transport_client` azure branch | **SUBSUME** into one resolver | **LOW** — behavior-preserving | ✅ **DONE** (`resolve_azure_deployment`, commit `92e51df4`) |
+| 2 | `evidence_audit.run_level_clean` ↔ `_apply_evidence_gate` (default **ON**) | **COMPOSE (already composes) — no structural merge** | **HIGH** — touches default-ON forge defense | ✅ **RESOLVED — no code change** (see below) |
 | 3 | `evidence_audit.apply_result_veto` (per-result) ↔ `evidence_gate` (per-leaf) | KEEP-SEPARATE-BY-STAGE | n/a | no change |
 | 4 | `evidence_audit` ↔ `champion_artifact` | KEEP-SEPARATE (orthogonal) | n/a | no change |
 | 5 | claim-grounding consumers | already one engine | n/a | no change |
-| 6 | finalize-path coverage asymmetry (champion + evidence-reconcile only on clean path) | **OPEN QUESTION — verify intent first** | **HIGH** — watchdog/SIGTERM blast radius | **INVESTIGATE, do not patch blindly** |
+| 6 | finalize-path coverage asymmetry (champion + evidence-reconcile only on clean path) | **INTENTIONAL — not a defect** | **HIGH** — watchdog/SIGTERM blast radius | ✅ **RESOLVED — no code change** (see below) |
 
 ### Decision 1 — SUBSUME the transport deployment resolver (DO NOW)
 `run.py::_validator_separation_tier` (run.py ~2103-2175) re-implements
@@ -103,28 +103,43 @@ transport builder (e.g. a pure `resolve_transport_deployment(backend, model)` or
 returning the resolved id) and have `_validator_separation_tier` consume it.
 Behavior-preserving; gate on the existing transport + validator-wiring tests.
 
-### Decision 2 — COMPOSE evidence_audit into the verdict gate, never RETIRE forge logic (DEFERRED)
+### Decision 2 — COMPOSE evidence_audit into the verdict gate, never RETIRE forge logic — RESOLVED: no code change
 `_apply_evidence_gate` runs under `OPENRESEARCH_EVIDENCE_GATE` which is **default
 ON** — this is the **P0 anti-forge defense** (the ledger/forged-row cross-check;
 `test_evidence_gate_forge.py` + the replay tests are its dedicated CI gate). The
-two already compose (`run_level_clean` is AND-ed in). **Do NOT delete or fold
-away the forged-row/ledger logic.** If future unification is pursued, it is
-limited to making `audit_evidence` *supply* the snapshot the gate reads, with the
-forge cross-check intact and **`test_evidence_gate_forge.py` + replay as the
-non-negotiable gate** (the default-OFF contract is NOT sufficient here). Until
-that is planned and TDD-covered, leave the composition as-is.
+audit found the two **already compose**: `audit_evidence(...).run_level_clean` is
+AND-ed into `_apply_evidence_gate` (`report.py:1524-1535,1617`), so a run already
+gets ONE effective evidence verdict. A *structural* merge — folding the gate's
+forged-row/ledger derivation into `audit_evidence` — would touch default-ON P0
+code for **marginal behavioural benefit** (the composition already achieves the
+unified verdict) at **high risk**. **Decision: keep the composition; do NOT
+restructure.** `audit_evidence` remains the canonical run-level snapshot that the
+gate *consumes*; the forge cross-check stays exactly where it is. If a future need
+ever forces a merge, the non-negotiable gate is `test_evidence_gate_forge.py` +
+the replay tests (the default-OFF contract is NOT sufficient), and the forged-row
+logic is never deleted — only relocated intact.
 
-### Decision 6 — finalize coverage asymmetry is an OPEN QUESTION, not a known bug
+### Decision 6 — finalize coverage asymmetry — RESOLVED: intentional, no code change
 `_apply_champion_artifact` and `_reconcile_verdict_against_evidence` run only
 inside `build_final_report` (clean `_finalize`); the fatal-abort and hard-stop
-paths skip them. This **may be intentional**: the salvage path
-(`_salvage_partial_report`) already does its OWN *capped* reconcile ("verdict
-reconciled ≤ partial"), and the clean-path `_reconcile_verdict_against_evidence`
-can *upgrade* — which is wrong for a dying process. Before any change: (a) confirm
-whether adding the clean-path reconcile to salvage risks an unwanted upgrade; (b)
-confirm whether adding `champion_artifact` *restore* (file I/O) inside a SIGTERM
-finalizer is safe under time pressure. Watchdog/SIGTERM handlers are the highest
-blast-radius code in the repo — do not "fix" without answering both.
+paths skip them. **Investigated (2026-06-21) — this is intentional and correct:**
+- `_reconcile_verdict_against_evidence` is **downgrade-only** (report.py:602/629,
+  "NEVER upgrades — only downgrades", `reproduced→partial`). Both non-clean paths
+  already cap the verdict at `partial` **before** it would run
+  (`_finalize_fatal_primitive_abort:1482` = `"partial" if evidence else "failed"`;
+  `_salvage_partial_report:1577` = `reconcile_verdict_with_score("partial", …)`).
+  So the missing reconcile is a **no-op** under that cap — adding it changes
+  nothing. (And it could never *upgrade*, so there was never an upgrade hazard
+  from the reconcile itself.)
+- `_apply_champion_artifact` **can upgrade** (it restores the best-median artifact
+  and ships its grade) and performs **file I/O** (`restore_snapshot` copies
+  `code/`). Skipping it on the dying-process salvage path is the **deliberate
+  conservative choice**: a hard-stop/SIGTERM finalizer ships the honestly-earned
+  `partial`, it does not run a code-restore under time pressure to lift the score.
+
+**Decision: leave both paths as-is.** The asymmetry encodes the correct policy
+(clean path may optimise to the best artifact; salvage ships a conservative,
+already-capped partial). No change to the watchdog/SIGTERM handlers.
 
 ## 4. Invariants this ADR locks in
 - Every layer stays **independently flag-gated**; unset ⇒ byte-for-byte today.
@@ -135,10 +150,17 @@ blast-radius code in the repo — do not "fix" without answering both.
 - No new run-level evidence derivation outside `audit_evidence`; no new transport
   dispatch outside `build_transport_client`.
 
-## 5. Sequencing note (for the operator)
-This ADR is safe to record regardless of merge state. **Executing** Decision 2 (a
-default-ON forge-defense refactor) on top of the current tower of **five unmerged,
-unreviewed PRs** (#115/#116/#111/#112/#114, nothing merged, repo not owned by the
-implementer) carries integration risk. Recommended: land/review #115 (history
-consolidation) and #116 (#110 integration) **before** building Phase-1 execution
-deeper than Decision 1. This is the operator's call.
+## 5. Phase 1 outcome + sequencing note (for the operator)
+**Phase 1 is complete.** The audit's central finding held up under scrutiny: the
+evidence/critic/validator machinery is **already well-composed and single-sourced**;
+the only genuine fork was the Azure deployment resolver (Decision 1, deduped). The
+two "scary" items dissolved on investigation — Decision 2 already composes (a
+structural merge is marginal value at high risk → no change), and Decision 6's
+asymmetry is the intended conservative policy (→ no change). So Phase 1 ships as
+**one real dedupe + an ADR that blesses the existing composition**, with zero
+changes to default-ON forge defense or the watchdog/SIGTERM handlers.
+
+**Sequencing:** the remaining gate is purely process — land/review **#115**
+(history consolidation) and **#116** (#110 integration + this ADR + Decision 1)
+before Phase 2 (BES SELECT → unified critic) builds on top. This is the operator's
+call; nothing further should be stacked on the unmerged tower without it.
