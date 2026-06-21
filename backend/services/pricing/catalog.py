@@ -204,6 +204,25 @@ GPU_PRICING: dict[str, GpuPriceEntry] = {
         last_audited_utc=_AUDITED,
         cloud_type="ONDEMAND",
     ),
+    # GCP L4 + H100 (a3 machine family, us-central1 on-demand) — total machine
+    # rates pairing the gcp_l4_24 / gcp_h100_80* catalog SKUs landed by the GKE
+    # backend. L4 = g2-standard-8 (~$0.85/hr); H100 = a3-highgpu-{1,8}g
+    # (~$11.06/GPU·node, ~$88.49 for 8×). Refresh quarterly.
+    "gcp_l4_24": GpuPriceEntry(
+        usd_per_hour=0.85,
+        last_audited_utc=_AUDITED,
+        cloud_type="ONDEMAND",
+    ),
+    "gcp_h100_80": GpuPriceEntry(
+        usd_per_hour=11.06,
+        last_audited_utc=_AUDITED,
+        cloud_type="ONDEMAND",
+    ),
+    "gcp_h100_80x8": GpuPriceEntry(
+        usd_per_hour=88.49,
+        last_audited_utc=_AUDITED,
+        cloud_type="ONDEMAND",
+    ),
 }
 
 
