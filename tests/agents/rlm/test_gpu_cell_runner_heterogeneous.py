@@ -118,13 +118,21 @@ def test_uniform_gpus_per_cell_no_sharing(tmp_path):
     for cell_id, gpu_ids, _, _ in records:
         assert len(gpu_ids) == 1, f"cell {cell_id!r} expected 1 GPU, got {gpu_ids}"
 
-    # At most 4 ran concurrently (4 available GPUs)
-    for i, (_, _, t0_a, t1_a) in enumerate(records):
-        concurrent = sum(
-            1 for _, _, t0_b, t1_b in records
-            if _intervals_overlap(t0_a, t1_a, t0_b, t1_b)
-        )
-        assert concurrent <= 4, f"more than 4 cells concurrently: {concurrent}"
+    # No GPU is held by two temporally-overlapping cells — the real no-sharing
+    # invariant. (A global "<= 4 concurrent" count measured from wall-clock
+    # timestamps is timing-racy under the thread pool and intermittently observes
+    # 5-6 near scheduling boundaries; the per-GPU disjointness below is what the
+    # 4-GPU / gpus_per_cell=1 placement actually guarantees, and is deterministic.)
+    for i, (cell_a, gpus_a, t0_a, t1_a) in enumerate(records):
+        for j, (cell_b, gpus_b, t0_b, t1_b) in enumerate(records):
+            if i == j:
+                continue
+            if _intervals_overlap(t0_a, t1_a, t0_b, t1_b):
+                shared = set(gpus_a) & set(gpus_b)
+                assert not shared, (
+                    f"cells {cell_a!r} and {cell_b!r} overlapped in time while "
+                    f"sharing GPU(s) {shared}"
+                )
 
 
 # ---------------------------------------------------------------------------
