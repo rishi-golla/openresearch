@@ -45,21 +45,16 @@ class GpuResolutionError(RuntimeError):
 
 
 def _provisioned_default_sku(
-    *,
     provider: str,
     fallback_short_name: str,
     provisioned_skus: tuple[str, ...] | None,
 ) -> "GpuSku":
-    """Cheapest fallback SKU for a provisioned cloud, honoring provisioning.
+    """Default SKU for the no-/low-confidence fallback on a provisioned cloud.
 
     When provisioned_skus is set, return the CHEAPEST provisioned SKU (so the
-    no-/low-confidence fallback Job targets a node pool that actually exists);
-    otherwise the global per-cloud fallback (``fallback_short_name``). Provider-
-    agnostic (azure|gcp). Fixes the unschedulable-pool hang where the fallback
-    proposed the cheapest catalog SKU (e.g. azure_a10_24) even when only a larger
-    SKU was provisioned — the K8s Job then sat Pending on a node pool that does
-    not exist. An empty tuple means "no restriction" (global fallback), matching
-    the primary-selection semantics.
+    fallback Job targets a node pool that actually exists); otherwise the global
+    cheapest-single-GPU fallback for ``provider``. Fixes the unschedulable-pool
+    hang when only a larger SKU is provisioned (azure AKS / gcp GKE alike).
     """
     if provisioned_skus:
         candidates: list[GpuSku] = []
@@ -279,11 +274,10 @@ def _resolve_provisioned_cloud(
     confidence = requirements.confidence
 
     # Fallback path: no estimate OR confidence too low → cheapest SKU, but honor
-    # provisioned_skus so the Job targets a node pool that actually exists.
+    # provisioned_skus so the fallback Job targets an existing node pool (the
+    # generic fallback_short_name may be a SKU the cluster never provisioned).
     if estimate is None or confidence < _CONFIDENCE_FLOOR:
-        sku = _provisioned_default_sku(provider=provider,
-                                       fallback_short_name=fallback_short_name,
-                                       provisioned_skus=provisioned_skus)
+        sku = _provisioned_default_sku(provider, fallback_short_name, provisioned_skus)
         full_ladder = _provisioned_ladder(provider=provider,
                                           min_effective_vram=sku.vram_gb * sku.gpu_count,
                                           max_per_gpu_usd=None,

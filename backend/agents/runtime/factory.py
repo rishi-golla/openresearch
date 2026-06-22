@@ -15,6 +15,10 @@ from backend.agents.runtime.base import (
     ProviderConfigurationError,
     ProviderName,
 )
+from backend.agents.runtime.foundry_endpoint import (
+    FOUNDRY_MODE_ALIASES,
+    has_foundry_credentials,
+)
 from backend.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -74,8 +78,12 @@ def _has_claude_subscription_oauth() -> bool:
 
     ``claude-agent-sdk`` spawns the ``claude`` CLI as a subprocess and inherits
     its OAuth session — so the predicate is "is there a valid stored session
-    on this machine that the CLI can read?"  There are two storage backends:
+    on this machine that the CLI can read?"  There are three credential sources:
 
+    - **Long-lived token** (headless / in-cluster, Stream B): ``claude setup-token``
+      mints a stable ``CLAUDE_CODE_OAUTH_TOKEN`` env var.  When set, the CLI and
+      the claude-agent-sdk honour it directly — no ``~/.claude/.credentials.json``
+      is needed.  This is the only viable path for unattended in-cluster runs.
     - **File-based** (Linux, older macOS, CI containers): ``claude login`` writes
       ``~/.claude/.credentials.json``. Existence of that file is sufficient proof.
     - **macOS Keychain** (modern Claude Code on macOS): the credentials are
@@ -97,13 +105,22 @@ def _has_claude_subscription_oauth() -> bool:
     warning with the symlink command the user should run.
 
     Returns True iff a stored session is detectable by the SDK (i.e. under
-    ``~`` or ``%USERPROFILE%``). On Windows, the ``claude`` binary may not be
-    on PATH (Git Bash doesn't inherit the Windows PATH entry for
-    ``~/.local/bin``), but the SDK can still read the credentials file and
-    locate the binary via known install paths.  Times out at 5 s on the
-    Keychain probe to prevent a hung Keychain Access daemon from blocking
-    pipeline startup.
+    ``~`` or ``%USERPROFILE%``, macOS Keychain, or ``CLAUDE_CODE_OAUTH_TOKEN``
+    env var). On Windows, the ``claude`` binary may not be on PATH (Git Bash
+    doesn't inherit the Windows PATH entry for ``~/.local/bin``), but the SDK
+    can still read the credentials file and locate the binary via known install
+    paths.  Times out at 5 s on the Keychain probe to prevent a hung Keychain
+    Access daemon from blocking pipeline startup.
     """
+    # 0. Long-lived token (headless/in-cluster, Stream B).
+    #    CLAUDE_CODE_OAUTH_TOKEN is honoured directly by the claude CLI and
+    #    the claude-agent-sdk without needing a credentials file.  When set we
+    #    treat it as equivalent to a stored session.  We do NOT warn about this
+    #    in _warn_on_shell_env_override — it is intentionally operator-supplied
+    #    in production and must not trigger a spurious "shell shadows .env" warning.
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", ""):
+        return True
+
     # 1. POSIX user home — the canonical location the SDK reads from.
     if os.path.isfile(os.path.expanduser("~/.claude/.credentials.json")):
         # On non-Windows, also verify a claude binary the SDK can spawn is available
@@ -222,6 +239,14 @@ def selected_provider(provider: ProviderName | str | None = None) -> ProviderNam
     if normalized in {"anthropic", "claude"}:
         return "anthropic"
     if normalized in {"openai", "oai"}:
+        return "openai"
+    # Azure OpenAI and Azure AI Foundry are not ProviderName literals; both ride
+    # the OpenAI SDK surface, so generic sub-agents may name them here and get
+    # the "openai" literal back (matching validate_provider_credentials, which
+    # returns "openai" for azure as the "closest ProviderName"). The dedicated
+    # Azure/Foundry runtimes are selected upstream in make_runtime() before this
+    # call; this branch only lets a caller that passed the name through resolve.
+    if normalized in {"azure", "azure-openai", "azure_openai"} | FOUNDRY_MODE_ALIASES:
         return "openai"
     raise ProviderConfigurationError(
         provider=normalized,
@@ -367,6 +392,36 @@ def configure_openai_agents_sdk_credentials(
         os.environ["OPENAI_ADMIN_KEY"] = admin_key
 
 
+def configure_azure_openai_credentials(settings: Any = None) -> bool:
+    """Bridge Azure OpenAI settings into the canonical ``AZURE_OPENAI_*`` env.
+
+    The Azure consumers — ``make_runtime("azure")`` /
+    ``_has_azure_openai_credentials``, the navigation accelerator,
+    ``grader_transport``, and ``AzureOpenAiAgentRuntime`` — all read
+    ``os.environ`` directly, but pydantic-settings reads ``.env`` *without*
+    mutating ``os.environ``. So a key supplied only in ``.env`` (or under the
+    Azure portal's ``AZURE_OPENAI_KEY1`` / ``KEY2`` labels) is invisible to
+    them. This funnels Settings — which honours ``.env`` and the KEY1/KEY2
+    aliases — into the canonical names once, before any consumer runs.
+
+    setdefault semantics: an explicit shell ``AZURE_OPENAI_*`` is never
+    overwritten (shell > .env, matching pydantic-settings precedence).
+    Idempotent. Returns True iff both a key and an endpoint are present after
+    the bridge (i.e. ``_has_azure_openai_credentials()``).
+    """
+    s = settings if settings is not None else get_settings(_force_reload=True)
+    for name, val in (
+        ("AZURE_OPENAI_API_KEY", getattr(s, "azure_openai_api_key", "")),
+        ("AZURE_OPENAI_ENDPOINT", getattr(s, "azure_openai_endpoint", "")),
+        ("AZURE_OPENAI_DEPLOYMENT", getattr(s, "azure_openai_deployment", "")),
+        ("AZURE_OPENAI_API_VERSION", getattr(s, "azure_openai_api_version", "")),
+    ):
+        val = (val or "").strip()
+        if val and not os.environ.get(name):
+            os.environ[name] = val
+    return _has_azure_openai_credentials()
+
+
 def configure_openai_agents_sdk_for_endpoint(
     base_url: str,
     api_key: str,
@@ -474,6 +529,38 @@ def make_runtime(
     Credentials are validated only when requested so tests and offline import
     paths can instantiate the orchestrator without requiring local secrets.
     """
+    # Azure OpenAI is not a ProviderName literal — selected_provider() /
+    # validate_provider_credentials() normalize it to "openai", which would
+    # build a plain OpenAI runtime. Branch first so an explicit "azure" request
+    # returns the Azure runtime (Stream D executor tier reachable directly).
+    if str(provider or "").lower() in {"azure", "azure-openai", "azure_openai"}:
+        if require_api_key and not _has_azure_openai_credentials():
+            raise ProviderConfigurationError(
+                provider="azure-openai",
+                reason=(
+                    "Azure OpenAI credentials are missing; set both "
+                    "AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT."
+                ),
+            )
+        from backend.agents.runtime.azure_openai_runtime import AzureOpenAiAgentRuntime
+
+        return AzureOpenAiAgentRuntime()
+    # Azure AI Foundry (OpenAI-compatible custom endpoint, e.g. Grok). Like
+    # plain Azure, it is not a ProviderName literal — branch first so an
+    # explicit "azure-foundry"/"grok" request returns the Foundry runtime
+    # (executor-tier reachable directly, key-only, no OAuth).
+    if str(provider or "").lower() in {"azure-foundry", "foundry", "grok"}:
+        if require_api_key and not has_foundry_credentials():
+            raise ProviderConfigurationError(
+                provider="azure-foundry",
+                reason=(
+                    "Azure Foundry credentials missing; set AZURE_FOUNDRY_ENDPOINT "
+                    "and AZURE_FOUNDRY_API_KEY (and AZURE_FOUNDRY_DEPLOYMENT)."
+                ),
+            )
+        from backend.agents.runtime.azure_foundry_runtime import AzureFoundryAgentRuntime
+
+        return AzureFoundryAgentRuntime()
     resolved = (
         validate_provider_credentials(provider)
         if require_api_key
@@ -499,6 +586,7 @@ __all__ = [
     "_scan_wsl_windows_credentials",
     "aggregate_auth_status",
     "configure_openai_agents_sdk_credentials",
+    "configure_azure_openai_credentials",
     "has_provider_credentials",
     "make_runtime",
     "selected_provider",

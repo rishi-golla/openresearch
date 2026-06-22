@@ -77,6 +77,12 @@ CATALOG: tuple[GpuSku, ...] = (
            aliases=("2x a100",),              provider="azure", gpu_count=2),
     GpuSku("Standard_NC96ads_A100_v4",  "azure_a100_80x4", 80, "ONDEMAND", 14.69,
            aliases=("4x a100",),              provider="azure", gpu_count=4),
+    # Standard_ND96asr_v4 = 8×A100-40GB SXM4 (NVLink).  This is the Azure mirror
+    # of the GCP a2-highgpu-8g node (catalog: gcp_a100_40x8).  Sized so the 7B
+    # 8-GPU SDAR cell fits one node; scale-to-zero ⇒ idle=$0.
+    # approx_usd_per_hr is the eastus on-demand list rate; refresh quarterly.
+    GpuSku("Standard_ND96asr_v4",      "azure_a100_40x8", 40, "ONDEMAND", 27.20,
+           aliases=("8x a100 40", "nd96"),    provider="azure", gpu_count=8),
 
     # GCP rows — Google Compute Engine A2 machine types on GKE. The provider SKU
     # id is the GCE machine type (e.g. "a2-highgpu-8g"); the orchestrator maps it
@@ -100,6 +106,17 @@ CATALOG: tuple[GpuSku, ...] = (
            aliases=("4x a100 80",),                     provider="gcp", gpu_count=4),
     GpuSku("a2-ultragpu-8g", "gcp_a100_80x8",  80, "ONDEMAND", 31.44,
            aliases=("8x a100 80",),                     provider="gcp", gpu_count=8),
+    # GCP L4 + H100 (opt-in step-up; A100 stays the default ladder).
+    # L4 = g2-standard-8 (1x L4-24GB); H100 = a3-highgpu-{1,8}g (H100-80GB SXM).
+    # approx_usd_per_hr = TOTAL machine on-demand rate (us-central1; refresh quarterly).
+    GpuSku("g2-standard-8", "gcp_l4_24",     24, "ONDEMAND",  0.85,
+           aliases=("l4", "l4 24", "nvidia l4"),     provider="gcp", gpu_count=1),
+    GpuSku("a3-highgpu-1g", "gcp_h100_80",   80, "ONDEMAND", 11.06,
+           aliases=("h100", "h100 80", "h100 80gb", "h100-80"),
+           provider="gcp", gpu_count=1),
+    GpuSku("a3-highgpu-8g", "gcp_h100_80x8", 80, "ONDEMAND", 88.49,
+           aliases=("8x h100", "8x h100 80", "a3-highgpu-8g"),
+           provider="gcp", gpu_count=8),
 )
 
 
