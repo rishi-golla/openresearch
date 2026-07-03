@@ -18,6 +18,16 @@ import pytest
 from backend.agents.rlm.claude_oauth_client import ClaudeOauthClient, _root_transport
 
 
+@pytest.fixture(autouse=True)
+def _zero_retry_ladder(monkeypatch):
+    """Keep the suite fast: the real backoff ladder (2s/20s/60s) would add
+    ~82s to every always-failing _cli_complete test. Ladder-behavior tests
+    re-set it explicitly; attempt COUNTS are unaffected by the zeros."""
+    monkeypatch.setattr(
+        "backend.agents.rlm.claude_oauth_client._RETRY_SLEEP_LADDER", (0.0, 0.0, 0.0)
+    )
+
+
 def _proc(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=["claude"], returncode=returncode, stdout=stdout, stderr=stderr)
 
@@ -197,7 +207,7 @@ def test_cli_complete_passes_scrubbed_env(monkeypatch):
     assert "CLAUDE_CODE_SESSION_ID" not in captured["env"]
 
 
-def test_cli_complete_retries_once_on_nonzero_exit(monkeypatch):
+def test_cli_complete_retries_on_nonzero_exit(monkeypatch):
     calls: list[int] = []
 
     def fake_run(cmd, **kw):
@@ -207,23 +217,46 @@ def test_cli_complete_retries_once_on_nonzero_exit(monkeypatch):
         return _proc(stdout=_cli_json(result="recovered"))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr("backend.agents.rlm.claude_oauth_client._RETRY_SLEEP_S", 0.0)
+    monkeypatch.setattr("backend.agents.rlm.claude_oauth_client._RETRY_SLEEP_LADDER", (0.0, 0.0, 0.0))
     out = ClaudeOauthClient()._cli_complete(system="", user="u", model="m")
     assert out is not None and out[0] == "recovered"
     assert len(calls) == 2
 
 
-def test_cli_complete_gives_up_after_one_retry(monkeypatch):
+def test_cli_complete_exhausts_backoff_ladder_then_gives_up(monkeypatch):
+    """The 2026-07-03 live incident: a mid-run OAuth token-refresh race makes the
+    CLI transiently report "Not logged in" (exit 1, error on STDOUT, stderr
+    empty). A single fast retry loses the same race — the ladder must allow
+    len(_RETRY_SLEEP_LADDER)+1 attempts before falling back to the SDK."""
     calls: list[int] = []
 
     def fake_run(cmd, **kw):
         calls.append(1)
-        return _proc(returncode=1, stderr="")
+        return _proc(
+            returncode=1,
+            stdout='{"type":"result","subtype":"success","is_error":true,'
+                   '"result":"Not logged in \u00b7 Please run /login"}',
+        )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr("backend.agents.rlm.claude_oauth_client._RETRY_SLEEP_S", 0.0)
+    monkeypatch.setattr("backend.agents.rlm.claude_oauth_client._RETRY_SLEEP_LADDER", (0.0, 0.0, 0.0))
     assert ClaudeOauthClient()._cli_complete(system="", user="u", model="m") is None
-    assert len(calls) == 2
+    assert len(calls) == 4
+
+
+def test_cli_complete_failure_log_includes_stdout(monkeypatch, caplog):
+    """exit=1 + empty stderr carries the actual error on STDOUT ("Not logged
+    in") — the failure log must include it or the incident is undiagnosable."""
+    import logging
+
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, **kw: _proc(returncode=1, stdout='{"result":"Not logged in"}'),
+    )
+    monkeypatch.setattr("backend.agents.rlm.claude_oauth_client._RETRY_SLEEP_LADDER", ())
+    with caplog.at_level(logging.WARNING, logger="backend.agents.rlm.claude_oauth_client"):
+        assert ClaudeOauthClient()._cli_complete(system="", user="u", model="m") is None
+    assert "Not logged in" in caplog.text
 
 
 def test_cli_complete_no_retry_on_timeout(monkeypatch):

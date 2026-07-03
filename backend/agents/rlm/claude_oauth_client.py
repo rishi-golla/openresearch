@@ -102,7 +102,13 @@ def _empty_root_turn_fallback() -> str:
 
 
 _CLI_DEFAULT_TIMEOUT_S = 600.0  # per-completion cap for the CLI subprocess
-_RETRY_SLEEP_S = 2.0  # pause before the single fast-failure CLI retry
+# Backoff ladder for fast CLI failures (seconds between attempts; attempts =
+# len(ladder)+1). Sized for the 2026-07-03 live incident: when the OAuth access
+# token expires mid-run, concurrent Claude processes race the single-use
+# refresh token and the losers transiently read "Not logged in" (exit 1, error
+# on STDOUT, stderr EMPTY) until the winner's fresh token lands in the
+# keychain — a 2s retry loses the same race; ~80s of patience rides it out.
+_RETRY_SLEEP_LADDER: tuple[float, ...] = (2.0, 20.0, 60.0)
 
 
 def _scrubbed_child_env() -> dict[str, str]:
@@ -375,10 +381,14 @@ class ClaudeOauthClient(BaseLM):
 
         Hardening (2026-07-03, post-incident): the child env is scrubbed of
         nested-session markers (see ``_scrubbed_child_env``), and a FAST failure
-        (non-zero exit / unparseable or error JSON) is retried once — the
-        2026-06-27 exit-1s were transient-shaped, and one retry converts a
-        transient hiccup into a non-event instead of a silent SDK downgrade.
-        Timeouts (expensive) and a missing binary (deterministic) do not retry.
+        (non-zero exit / unparseable or error JSON) walks the
+        ``_RETRY_SLEEP_LADDER`` backoff before falling back to the SDK — the
+        live incident was an OAuth token-refresh race ("Not logged in" on
+        STDOUT, exit 1, stderr empty) that clears once a concurrent process
+        lands the refreshed token; a fast retry loses the same race. Failure
+        logs always include the STDOUT tail (that's where ``--print`` puts the
+        actual error). Timeouts (expensive) and a missing binary
+        (deterministic) do not retry.
         """
         import json as _json
         import subprocess
@@ -396,7 +406,8 @@ class ClaudeOauthClient(BaseLM):
             cmd += ["--append-system-prompt", system]
 
         data: dict | None = None
-        for attempt in (1, 2):
+        max_attempts = len(_RETRY_SLEEP_LADDER) + 1
+        for attempt in range(1, max_attempts + 1):
             try:
                 proc = subprocess.run(
                     cmd,
@@ -421,7 +432,12 @@ class ClaudeOauthClient(BaseLM):
 
             failure: str | None = None
             if proc.returncode != 0:
-                failure = f"exit={proc.returncode} stderr={(proc.stderr or '')[:200]}"
+                # --print writes the real error to STDOUT ("Not logged in ·
+                # Please run /login"); stderr is typically EMPTY — log both.
+                failure = (
+                    f"exit={proc.returncode} stderr={(proc.stderr or '')[:200]} "
+                    f"stdout={(proc.stdout or '')[-300:]}"
+                )
             else:
                 try:
                     parsed = _json.loads(proc.stdout)
@@ -435,10 +451,11 @@ class ClaudeOauthClient(BaseLM):
                         or parsed.get("subtype") != "success"
                     ):
                         failure = (
-                            "error result is_error=%s subtype=%s"
+                            "error result is_error=%s subtype=%s result=%.200s"
                             % (
                                 (parsed or {}).get("is_error") if isinstance(parsed, dict) else "?",
                                 (parsed or {}).get("subtype") if isinstance(parsed, dict) else "?",
+                                str((parsed or {}).get("result")) if isinstance(parsed, dict) else "",
                             )
                         )
                     else:
@@ -446,20 +463,22 @@ class ClaudeOauthClient(BaseLM):
 
             if data is not None:
                 break
-            if attempt == 1:
+            if attempt < max_attempts:
+                delay = _RETRY_SLEEP_LADDER[attempt - 1]
                 logger.warning(
-                    "ClaudeOauthClient._cli_complete: %s (bin=%s) — retrying once",
-                    failure, cli_bin,
+                    "ClaudeOauthClient._cli_complete: %s (bin=%s) — retrying in %.0fs "
+                    "(attempt %d/%d)",
+                    failure, cli_bin, delay, attempt, max_attempts,
                 )
-                if _RETRY_SLEEP_S > 0:
-                    _time.sleep(_RETRY_SLEEP_S)
+                if delay > 0:
+                    _time.sleep(delay)
                 continue
             logger.error(
-                "ClaudeOauthClient._cli_complete: %s (bin=%s) after retry — falling "
-                "back to the SDK transport (root quality degrades). If this run was "
-                "launched from a GUI agent terminal, check for a stale "
-                "OPENRESEARCH_CLAUDE_CLI_BIN or an app-bundled `claude` on PATH.",
-                failure, cli_bin,
+                "ClaudeOauthClient._cli_complete: %s (bin=%s) after %d attempts — "
+                "falling back to the SDK transport (root quality degrades). "
+                "'Not logged in' here means an OAuth token-refresh race with a "
+                "concurrent Claude session; it clears when the fresh token lands.",
+                failure, cli_bin, max_attempts,
             )
             return None
 
