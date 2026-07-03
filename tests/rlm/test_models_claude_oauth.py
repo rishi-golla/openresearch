@@ -248,3 +248,38 @@ class TestOAuthRootModelPinCanonicalEnv:
         )
         assert s.rlm_root_model == "claude-oauth"
         assert s.rlm_root_model_name == "claude-opus-4-8"
+
+
+class TestPlannerStampHonesty:
+    """A pinned OAuth root must stamp final_report.models.planner with the model
+    that ACTUALLY drove the loop (key:model), mirroring the RoleSpec stamp
+    vocabulary; unpinned runs stay byte-identical ("claude-oauth")."""
+
+    def _resolve(self, monkeypatch, pin: str | None):
+        from backend.agents.runtime import factory as _factory
+        monkeypatch.setattr(_factory, "has_provider_credentials", lambda p: True)
+        for var in ("OPENRESEARCH_RLM_ROOT_MODEL_NAME", "REPROLAB_RLM_ROOT_MODEL_NAME"):
+            monkeypatch.delenv(var, raising=False)
+        # Isolate from the developer's real .env: the rlm library load_dotenv()s
+        # it into os.environ at import, and models.py's Settings fallback reads
+        # it directly — either path would leak a real pin into this test.
+        _stub_settings_pin(monkeypatch, pin or "")
+        if pin:
+            monkeypatch.setenv("OPENRESEARCH_RLM_ROOT_MODEL_NAME", pin)
+        from backend.agents.rlm.models import resolve_root_model
+        return resolve_root_model("claude-oauth")
+
+    def test_pinned_root_stamps_key_and_model(self, monkeypatch):
+        from backend.agents.rlm.run import _planner_stamp_for
+        entry = self._resolve(monkeypatch, "claude-opus-4-8")
+        assert _planner_stamp_for(entry) == "claude-oauth:claude-opus-4-8"
+
+    def test_unpinned_root_stamps_none(self, monkeypatch):
+        from backend.agents.rlm.run import _planner_stamp_for
+        entry = self._resolve(monkeypatch, None)
+        assert _planner_stamp_for(entry) is None
+
+    def test_non_oauth_root_stamps_none(self, monkeypatch):
+        from backend.agents.rlm.run import _planner_stamp_for
+        from backend.agents.rlm.models import ROOT_MODELS
+        assert _planner_stamp_for(ROOT_MODELS["gpt-5"]) is None
