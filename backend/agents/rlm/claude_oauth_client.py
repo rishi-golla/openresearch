@@ -102,18 +102,57 @@ def _empty_root_turn_fallback() -> str:
 
 
 _CLI_DEFAULT_TIMEOUT_S = 600.0  # per-completion cap for the CLI subprocess
+_RETRY_SLEEP_S = 2.0  # pause before the single fast-failure CLI retry
+
+
+def _scrubbed_child_env() -> dict[str, str]:
+    """Child env for the ``claude`` CLI subprocess, minus nested-session markers.
+
+    A run launched from inside another Claude Code session (cmux / the desktop
+    app / this very CLI) inherits ``CLAUDECODE`` and ``CLAUDE_CODE_*`` —
+    markers that tell the child CLI it is nested inside an agent session. On
+    2026-06-27 that inheritance (plus the app-bundled binary) made every root
+    ``claude --print`` exit 1 with empty stderr, silently degrading the run to
+    the FM-001-prone SDK fallback until it aborted as ``root_degenerate_loop``.
+    These vars are never legitimate for the child — scrub them unconditionally.
+    """
+    import os
+
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE_")
+    }
 
 
 def _claude_cli_bin() -> str:
-    """Resolve the ``claude`` CLI binary (override with ``OPENRESEARCH_CLAUDE_CLI_BIN``)."""
+    """Resolve the ``claude`` CLI binary (override with ``OPENRESEARCH_CLAUDE_CLI_BIN``).
+
+    PATH resolution prefers a stock install over a GUI-app-bundled CLI
+    (``/Applications/cmux.app/.../bin/claude`` shadows the npm one PATH-first
+    inside cmux terminals — the 2026-06-27 root-transport incident). An
+    explicit ``OPENRESEARCH_CLAUDE_CLI_BIN`` always wins.
+    """
     import os
     import shutil
 
-    return (
-        os.environ.get("OPENRESEARCH_CLAUDE_CLI_BIN", "").strip()
-        or shutil.which("claude")
-        or "claude"
-    )
+    override = os.environ.get("OPENRESEARCH_CLAUDE_CLI_BIN", "").strip()
+    if override:
+        return override
+
+    candidates: list[str] = []
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d:
+            continue
+        p = os.path.join(d, "claude")
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            candidates.append(p)
+    for p in candidates:
+        if ".app/" not in p and ".app\\" not in p:
+            return p
+    if candidates:
+        return candidates[0]
+    return shutil.which("claude") or "claude"
 
 
 def _root_transport() -> str:
@@ -274,9 +313,12 @@ class ClaudeOauthClient(BaseLM):
                 if (text or "").strip():
                     return text
                 return _empty_root_turn_fallback()
-            logger.warning(
+            logger.error(
                 "ClaudeOauthClient.completion: CLI transport unavailable/failed — "
-                "falling back to claude-agent-sdk for this call."
+                "falling back to claude-agent-sdk for this call. Repeated fallbacks "
+                "degrade the root loop (empty/prose turns → forced-iteration "
+                "refusals); if persistent, set OPENRESEARCH_CLAUDE_CLI_BIN to a "
+                "stock `claude` install."
             )
 
         # FALLBACK / legacy: claude-agent-sdk path. Lazily build a per-model
@@ -330,12 +372,21 @@ class ClaudeOauthClient(BaseLM):
         STDIN — never argv — so an arbitrarily large REPL-state prompt cannot hit
         ``ARG_MAX``. Tools are disallowed so the root emits text on turn 1,
         mirroring the SDK path's ``tools=[]`` contract.
+
+        Hardening (2026-07-03, post-incident): the child env is scrubbed of
+        nested-session markers (see ``_scrubbed_child_env``), and a FAST failure
+        (non-zero exit / unparseable or error JSON) is retried once — the
+        2026-06-27 exit-1s were transient-shaped, and one retry converts a
+        transient hiccup into a non-event instead of a silent SDK downgrade.
+        Timeouts (expensive) and a missing binary (deterministic) do not retry.
         """
         import json as _json
         import subprocess
+        import time as _time
 
+        cli_bin = _claude_cli_bin()
         cmd = [
-            _claude_cli_bin(),
+            cli_bin,
             "--print",
             "--output-format", "json",
             "--model", model,
@@ -344,49 +395,75 @@ class ClaudeOauthClient(BaseLM):
         if system:
             cmd += ["--append-system-prompt", system]
 
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=user,           # STDIN — ARG_MAX-safe for large prompts
-                capture_output=True,
-                text=True,
-                timeout=_cli_timeout_s(),
-            )
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                "ClaudeOauthClient._cli_complete: timed out after %.0fs",
-                _cli_timeout_s(),
-            )
-            return None
-        except (FileNotFoundError, OSError) as exc:
-            logger.warning(
-                "ClaudeOauthClient._cli_complete: claude CLI unavailable (%s)", exc
+        data: dict | None = None
+        for attempt in (1, 2):
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=user,           # STDIN — ARG_MAX-safe for large prompts
+                    capture_output=True,
+                    text=True,
+                    timeout=_cli_timeout_s(),
+                    env=_scrubbed_child_env(),
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "ClaudeOauthClient._cli_complete: timed out after %.0fs (bin=%s)",
+                    _cli_timeout_s(), cli_bin,
+                )
+                return None
+            except (FileNotFoundError, OSError) as exc:
+                logger.warning(
+                    "ClaudeOauthClient._cli_complete: claude CLI unavailable (%s, bin=%s)",
+                    exc, cli_bin,
+                )
+                return None
+
+            failure: str | None = None
+            if proc.returncode != 0:
+                failure = f"exit={proc.returncode} stderr={(proc.stderr or '')[:200]}"
+            else:
+                try:
+                    parsed = _json.loads(proc.stdout)
+                except (ValueError, TypeError):
+                    parsed = None
+                    failure = f"non-JSON stdout ({(proc.stdout or '')[:200]})"
+                if failure is None:
+                    if (
+                        not isinstance(parsed, dict)
+                        or parsed.get("is_error")
+                        or parsed.get("subtype") != "success"
+                    ):
+                        failure = (
+                            "error result is_error=%s subtype=%s"
+                            % (
+                                (parsed or {}).get("is_error") if isinstance(parsed, dict) else "?",
+                                (parsed or {}).get("subtype") if isinstance(parsed, dict) else "?",
+                            )
+                        )
+                    else:
+                        data = parsed
+
+            if data is not None:
+                break
+            if attempt == 1:
+                logger.warning(
+                    "ClaudeOauthClient._cli_complete: %s (bin=%s) — retrying once",
+                    failure, cli_bin,
+                )
+                if _RETRY_SLEEP_S > 0:
+                    _time.sleep(_RETRY_SLEEP_S)
+                continue
+            logger.error(
+                "ClaudeOauthClient._cli_complete: %s (bin=%s) after retry — falling "
+                "back to the SDK transport (root quality degrades). If this run was "
+                "launched from a GUI agent terminal, check for a stale "
+                "OPENRESEARCH_CLAUDE_CLI_BIN or an app-bundled `claude` on PATH.",
+                failure, cli_bin,
             )
             return None
 
-        if proc.returncode != 0:
-            logger.warning(
-                "ClaudeOauthClient._cli_complete: exit=%d stderr=%.200s",
-                proc.returncode,
-                proc.stderr or "",
-            )
-            return None
-        try:
-            data = _json.loads(proc.stdout)
-        except (ValueError, TypeError):
-            logger.warning(
-                "ClaudeOauthClient._cli_complete: non-JSON stdout (%.200s)",
-                proc.stdout or "",
-            )
-            return None
-        if not isinstance(data, dict) or data.get("is_error") or data.get("subtype") != "success":
-            logger.warning(
-                "ClaudeOauthClient._cli_complete: error result is_error=%s subtype=%s",
-                (data or {}).get("is_error") if isinstance(data, dict) else "?",
-                (data or {}).get("subtype") if isinstance(data, dict) else "?",
-            )
-            return None
-
+        assert data is not None  # loop either broke with data or returned None
         text = str(data.get("result") or "")
         usage_raw = data.get("usage") or {}
         usage = {
